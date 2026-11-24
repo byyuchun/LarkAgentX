@@ -43,6 +43,7 @@ class ChatConfigIn(BaseModel):
     chat_id: str = Field(..., min_length=1, max_length=64, pattern=r'^[A-Za-z0-9_-]+$')
     workdir: str = Field('', max_length=500)
     senders: List[str] = Field(default_factory=list, max_length=200)   # 群聊里只回复这些人,空 = 所有人
+    notes: str = Field('', max_length=2000)                            # 会话说明: 每次换新内容时附给 agent
 
 
 class SettingsIn(BaseModel):

@@ -342,6 +342,43 @@ class Storage:
         finally:
             s.close()
 
+    def context_messages(self, chat_id: str, anchor: str = None, since_ts: int = None, until_ts: int = None, limit: int = 30):
+        """给 agent 当上下文的消息: since_ts 之后(不含)、until_ts 之前(含)的最后 limit 条,按时间先后。
+        anchor 为 None 时不分话题。"""
+        s = self.Session()
+        try:
+            q = _without_echo_twins(s.query(Message)).filter(Message.chat_id == str(chat_id))
+            if anchor is not None:
+                q = q.filter(Message.anchor == anchor)
+            if since_ts:
+                q = q.filter(Message.create_time > int(since_ts))
+            if until_ts:
+                q = q.filter(Message.create_time <= int(until_ts))
+            rows = q.order_by(desc(Message.create_time), desc(Message.id)).limit(limit).all()
+            rows.reverse()
+            return rows
+        finally:
+            s.close()
+
+    def get_message(self, msg_id: str, chat_id: str = None):
+        s = self.Session()
+        try:
+            q = s.query(Message).filter(Message.msg_id == str(msg_id))
+            if chat_id:
+                q = q.filter(Message.chat_id == str(chat_id))
+            return q.first()
+        finally:
+            s.close()
+
+    def has_outgoing_since(self, chat_id: str, since: int) -> bool:
+        """这个会话在 since(秒,含)之后有没有发出去的消息。"""
+        s = self.Session()
+        try:
+            return s.query(Message.id).filter(Message.chat_id == str(chat_id), Message.direction == 'out',
+                                              Message.create_time >= int(since)).first() is not None
+        finally:
+            s.close()
+
     def p2p_peers(self, chat_ids, me: str = '') -> dict:
         """{私聊会话 id: 对方 user_id},从本地消息里找不是我发的那一方。"""
         chat_ids = [str(c) for c in chat_ids]

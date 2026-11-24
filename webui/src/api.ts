@@ -119,6 +119,7 @@ export interface ChatConfig {
   chat_id: string
   workdir: string
   senders: string[]
+  notes: string
 }
 
 /** 会话名单里的一项: 群(kind=group,id 是会话 id)、私聊(kind=p2p,id 是会话 id);搜索结果里的人是 kind=user,id 是 user_id */

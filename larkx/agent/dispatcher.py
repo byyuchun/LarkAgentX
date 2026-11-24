@@ -7,7 +7,11 @@ from loguru import logger
 
 from .. import accounts, memory
 
-INSTRUCTIONS = '以上是飞书会话里新到的一条消息(XML 里有会话/发送者/内容)。你是这个数字人,完整对话历史你都有。如果对方也是机器人且只是互相客套寒暄,直接结束不要再接话。'
+INSTRUCTIONS = '以上是飞书会话里新到的消息。你是这个数字人,代表本人回复。如果对方也是机器人且只是互相客套寒暄,直接结束不要再接话。'
+# 讲清楚上下文的结构,不管用户有没有自定义系统提示词都附上
+CONTEXT_GUIDE = ('<history> 是这个会话自你上次处理以来的消息,按时间先后。needs_reply="true" 的是这次要你处理的'
+                 '(可能是连着发的好几条,合在一起回一次,不要逐条回);role="me" 是本人亲手发的(你代表的就是他:'
+                 '别重复他已经说过的,别和他矛盾,他已经回答了就不用再回);其余是上下文。<quoted> 是被回复/引用的原消息。')
 OUTPUT_RULES = '不需要回复就直接结束,不要解释、不要复述消息。'
 # 发送选项,写给 agent 看。撤回、转发、@ 只在明确要求时用
 SEND_HELP = ('lark send 的其他用法: -m 按 markdown 发(代码块、列表、加粗、链接);--mention 用户id:名字 真正 @ 某人(可重复,'
@@ -17,6 +21,26 @@ SEND_HELP = ('lark send 的其他用法: -m 按 markdown 发(代码块、列表�
 # 太久以前的消息(重启后排队里剩下的、补收回来的)只入库不回复,免得回复几个小时前的事
 STALE_SECONDS = 600
 REVIEW_KEY = 'memory-review'
+BATCH_SECONDS = 3           # 收到要处理的消息后再等这么久,连着发的几条合成一轮
+CONTEXT_LIMIT = 40          # 一轮最多带多少条历史消息
+FIRST_CONTEXT_LIMIT = 15    # 这个会话还没处理过(或刚重启)时往前带多少条
+FIRST_CONTEXT_SECONDS = 86400   # ……而且只带最近 24 小时的,几天前的旧话题不带
+CONTEXT_CHARS = 1500        # 每条历史消息最多带多少字
+TYPE_NAMES = {1: '私聊', 2: '群聊', 3: '话题群'}
+
+
+def _attr(v) -> str:
+    return quoteattr(str(v if v is not None else ''))
+
+
+def _clip(text: str, n: int = CONTEXT_CHARS) -> str:
+    text = str(text or '')
+    return text if len(text) <= n else text[:n] + f'…(后面还有 {len(text) - n} 字)'
+
+
+def batchable(msg: dict) -> bool:
+    """普通聊天消息可以合并;定时任务、每日回顾各自单独一轮。"""
+    return msg.get('_task') is None and msg.get('_review') is None
 
 
 def chat_config(cfg: dict, chat_id) -> dict:
@@ -74,11 +98,33 @@ class SessionWorker:
         self._interrupted = False
         self.task = asyncio.create_task(self._run())
 
+    def _drain(self) -> tuple:
+        """取出队列里现有的全部条目,分成能合并的聊天消息和其余(任务/回顾,放回队尾)。"""
+        chat, other = [], []
+        while True:
+            try:
+                item = self.queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            (chat if batchable(item[1]) else other).append(item)
+        for item in other:
+            self.queue.put_nowait(item)
+        return chat, bool(other)
+
     async def _run(self):
         while True:
-            pending_id, msg = await self.queue.get()
+            batch = [await self.queue.get()]
             self.busy, self._interrupted = True, False
-            self.current = asyncio.ensure_future(self.dispatcher.handle_message(self.session_key, msg))
+            if batchable(batch[0][1]):
+                # 等对方说完: 安静 BATCH_SECONDS 秒才开始;agent 处理期间新来的消息也会在下一轮一起交过去
+                while True:
+                    await asyncio.sleep(self.dispatcher.batch_seconds)
+                    more, _ = self._drain()
+                    if not more:
+                        break
+                    batch += more
+            msgs = [m for _, m in batch]
+            self.current = asyncio.ensure_future(self.dispatcher.handle_batch(self.session_key, msgs))
             try:
                 await self.current
             except asyncio.CancelledError:
@@ -88,7 +134,8 @@ class SessionWorker:
             except Exception as e:
                 self.dispatcher.log.error(f'处理消息异常 [{self.session_key}]: {e}')
             self.busy, self.current = False, None
-            self.dispatcher.forget(pending_id)
+            for pending_id, _ in batch:
+                self.dispatcher.forget(pending_id)
 
     def interrupt(self) -> bool:
         """打断正在跑的这条(agent 子进程会被杀掉)。"""
@@ -108,9 +155,12 @@ class AgentDispatcher:
         self.reply_fn = reply_fn
         self.storage = storage
         self.workers = {}
-        self.memory_seen = {}      # session_key -> 上次附上的记忆内容
+        self.memory_seen = {}      # session_key -> 上次附上的记忆/会话说明
+        self.context_mark = {}     # session_key -> 上次交给 agent 的最后一条消息的时间(下一轮从这之后带历史)
+        self.batch_seconds = BATCH_SECONDS
         self.denied = None         # 名单外的人触发时的回调(由 Listener 设置)
         self.accepted = None       # 消息交给 agent 时的回调(点 👌)
+        self.handled = None        # agent 处理完一条聊天消息后的回调(回复过就标已读)
 
     def session_key_of(self, msg: dict) -> str:
         scope = self.cfg['context_scope']
@@ -188,6 +238,7 @@ class AgentDispatcher:
         if cmd == 'clear':
             self.backend.reset_session(key)
             self.memory_seen.pop(key, None)
+            self.context_mark.pop(key, None)
         stopped = self._interrupt(key)
         if remainder:
             await self._enqueue({**msg, 'content': remainder}, chat_name, sender_name)
@@ -271,6 +322,7 @@ class AgentDispatcher:
         self._interrupt(session_key)
         self.backend.reset_session(session_key)
         self.memory_seen.pop(session_key, None)
+        self.context_mark.pop(session_key, None)
         return n
 
     def _parse_command(self, content: str):
@@ -313,18 +365,95 @@ class AgentDispatcher:
     def _account_flag(self) -> str:
         return '' if self.account_id == accounts.DEFAULT_ID else f' --account {self.account_id}'
 
-    def _memory_prefix(self, session_key: str, chat_id: str = '') -> str:
-        """开了长期记忆时,这个会话第一次处理、或者记忆变了,才附上最新的记忆。
+    def _memory_prefix(self, session_key: str, chat_id: str = '', preview: bool = False) -> str:
+        """会话说明 + 长期记忆。这个会话第一次处理、或者内容变了,才附上最新的,免得会话历史越堆越长。
         列在「只处理这些会话」里的会话附它自己的独立记忆,其余附共用记忆。"""
-        if not self.cfg.get('memory_enabled'):
+        parts = []
+        notes = (chat_config(self.cfg, chat_id).get('notes') or '').strip() if chat_id else ''
+        if notes:
+            parts.append(f'<conversation_notes>\n{escape(notes)}\n</conversation_notes>\n'
+                         '以上是本人给这个会话写的说明(这个会话是做什么的、要注意什么),回复时遵守。')
+        if self.cfg.get('memory_enabled'):
+            parts.append(memory.prompt_block(self.account_id, memory.scope_for(self.cfg, chat_id)))
+        block = '\n\n'.join(parts)
+        if not block or (self.memory_seen.get(session_key) == block and not preview):
             return ''
-        block = memory.prompt_block(self.account_id, memory.scope_for(self.cfg, chat_id))
-        if self.memory_seen.get(session_key) == block:
-            return ''
-        self.memory_seen[session_key] = block
+        if not preview:
+            self.memory_seen[session_key] = block
         return block + '\n\n'
 
-    def build_prompt(self, session_key: str, msg: dict) -> str:
+    def _conversation_xml(self, session_key: str, msgs: list, preview: bool = False) -> str:
+        """这一轮要处理的消息,连同这个会话(话题)自上一轮以来的其他消息、被引用的原消息,一起组成上下文。"""
+        last = msgs[-1]
+        chat_id = str(last['chat_id'])
+        anchor = last.get('anchor') or ''
+        triggers = {str(m.get('msg_id')): m for m in msgs if m.get('msg_id')}
+        until = max(int(m.get('create_time') or 0) for m in msgs) or None
+        since = self.context_mark.get(session_key)
+        floor = since or ((until or int(time.time())) - FIRST_CONTEXT_SECONDS)
+        rows = []
+        if self.storage:
+            try:
+                rows = self.storage.context_messages(chat_id, anchor if self.cfg.get('context_scope') == 'anchor' else None,
+                                                     floor, until, CONTEXT_LIMIT if since else FIRST_CONTEXT_LIMIT)
+            except Exception as e:
+                self.log.debug(f'读取上下文消息失败(只带这一轮的消息): {e}')
+        agent_ids = set()
+        if rows and self.storage:
+            try:
+                agent_ids = self.storage.agent_sent_ids([r.msg_id for r in rows])
+            except Exception:
+                agent_ids = set()
+        items, seen = [], set()
+        for r in rows:
+            mid = str(r.msg_id)
+            if mid in agent_ids and mid not in triggers:
+                continue                 # agent 自己发的,它的会话里本来就有
+            seen.add(mid)
+            m = triggers.get(mid)
+            items.append(self._message_xml(
+                mid, r.create_time, r.sender_name or (m or {}).get('_sender_name', ''), r.sender_id,
+                'me' if r.direction == 'out' else 'other', r.content, needs_reply=mid in triggers,
+                at_me=bool(m and m.get('at_me')), reply_to=r.parent_id or ''))
+        for mid, m in triggers.items():  # 库里还没有的(理论上不会)也要带上
+            if mid not in seen:
+                items.append(self._message_xml(mid, m.get('create_time'), m.get('_sender_name', ''), m.get('from_id'),
+                                               'other', m.get('content'), needs_reply=True, at_me=bool(m.get('at_me')),
+                                               reply_to=m.get('parent_id') or ''))
+                seen.add(mid)
+        quoted = []
+        for m in msgs:
+            pid = str(m.get('parent_id') or '')
+            if pid and pid not in seen and self.storage:
+                try:
+                    q = self.storage.get_message(pid, chat_id)
+                except Exception:
+                    q = None
+                if q:
+                    seen.add(pid)
+                    quoted.append(f'<quoted id={_attr(pid)} from={_attr(q.sender_name)} time={_attr(_ts({"create_time": q.create_time}))}>'
+                                  f'{escape(_clip(q.content))}</quoted>')
+        if not preview:
+            self.context_mark[session_key] = until or int(time.time())
+        head = (f'<conversation id={_attr(chat_id)} name={_attr(last.get("_chat_name") or "")} '
+                f'type={_attr(TYPE_NAMES.get(last.get("chat_type"), last.get("chat_type_name") or ""))} topic={_attr(anchor)}>')
+        note = '' if since else '\n<!-- 这是这个会话最近的消息,其中有些你之前可能已经看过 -->'
+        return '\n'.join([head + note, '<history>', *items, '</history>', *quoted, '</conversation>'])
+
+    @staticmethod
+    def _message_xml(msg_id, create_time, sender, sender_id, role, content, needs_reply=False, at_me=False, reply_to='') -> str:
+        attrs = f'id={_attr(msg_id)} time={_attr(_ts({"create_time": create_time}))} from={_attr(sender)} from_id={_attr(sender_id)} role={_attr(role)}'
+        if needs_reply:
+            attrs += ' needs_reply="true"'
+        if at_me:
+            attrs += ' at_me="true"'
+        if reply_to:
+            attrs += f' reply_to={_attr(reply_to)}'
+        return f'  <message {attrs}>{escape(_clip(content))}</message>'
+
+    def build_prompt(self, session_key: str, msgs, preview: bool = False) -> str:
+        msgs = msgs if isinstance(msgs, list) else [msgs]
+        msg = msgs[-1]
         acct = self._account_flag()
         if msg.get('_review') is not None:
             return (memory.prompt_block(self.account_id) + '\n\n' + memory.REVIEW_PROMPT.format(acct=acct) + '\n\n<chats>\n'
@@ -334,14 +463,21 @@ class AgentDispatcher:
             body = f'<task>\n  <chat id={quoteattr(chat_id)} anchor={quoteattr(str(msg.get("anchor") or ""))}/>\n  <content>{escape(msg["_task"])}</content>\n</task>'
             lead = '以上是你之前安排的定时任务,现在到点了,请执行。'
         else:
-            body = build_xml_message(msg)
+            body = self._conversation_xml(session_key, msgs, preview) + '\n' + CONTEXT_GUIDE
             lead = self.cfg.get('system_prompt') or INSTRUCTIONS
         reply_cmd = f'lark send {chat_id} "<回复内容>"' + self.reply_flags(msg) + acct
         rules = f'要回复就执行: {reply_cmd}\n' + OUTPUT_RULES + '\n' + SEND_HELP
-        return self._memory_prefix(session_key, chat_id) + body + '\n\n' + lead + '\n' + rules
+        return self._memory_prefix(session_key, chat_id, preview) + body + '\n\n' + lead + '\n' + rules
 
     async def handle_message(self, session_key: str, msg: dict):
-        prompt = self.build_prompt(session_key, msg)
+        await self.handle_batch(session_key, [msg])
+
+    async def handle_batch(self, session_key: str, msgs: list):
+        """一轮: 这批消息(连着发的合在一起)交给 agent。回复参数、工作目录按最后一条算。"""
+        msg = msgs[-1]
+        if len(msgs) > 1:
+            self.log.info(f'[{session_key}] 连着来的 {len(msgs)} 条消息合成一轮处理')
+        prompt = self.build_prompt(session_key, msgs)
         try:
             kwargs = {}
             wd = workdir_for(self.cfg, msg.get('chat_id') or '')
@@ -352,5 +488,9 @@ class AgentDispatcher:
             # 第一轮没跑成功时会话还没建立(下次会换一个新会话),记忆下次要重新附上
             if not self.backend.session_started(session_key):
                 self.memory_seen.pop(session_key, None)
+                self.context_mark.pop(session_key, None)
         if out:
             self.log.debug(f'[{session_key}] agent 输出: {out[:200]}')
+        if self.handled and batchable(msg):
+            for m in msgs:
+                await self.handled(m)

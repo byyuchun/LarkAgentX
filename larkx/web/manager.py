@@ -288,8 +288,9 @@ class Manager:
             if path and not os.path.isdir(path):
                 raise ValueError(f'工作目录不存在: {path}')
             senders = [str(u) for u in row.get('senders') or [] if _ID.fullmatch(str(u))]
-            if path or senders:
-                rows.append({'chat_id': str(row['chat_id']), 'workdir': path, 'senders': senders})
+            notes = (row.get('notes') or '').strip()
+            if path or senders or notes:
+                rows.append({'chat_id': str(row['chat_id']), 'workdir': path, 'senders': senders, 'notes': notes})
         data['chat_configs'] = rows
         t = data.get('triggers') or {}
         for key in ('include_chats', 'exclude_chats'):
@@ -606,6 +607,32 @@ class Manager:
             if not info.get(chat_id, ('', 0))[0]:
                 self.storage(account_id).update_chat_name(chat_id, name, 1)
         return {'kind': 'p2p', 'id': chat_id, 'name': name, 'desc': '', 'avatar': f'/api/accounts/{account_id}/avatars/user/{user_id}'}
+
+    def context_preview(self, account_id: str, chat_id: str) -> dict:
+        """假设这个会话里最新一条别人的消息现在触发了 agent,它会收到的完整输入。不改任何状态。"""
+        from ..agent.dispatcher import AgentDispatcher
+        account_id = self.require(account_id)
+        if not _ID.fullmatch(str(chat_id)):
+            raise ValueError('会话 id 不合法')
+        st = self.storage(account_id)
+        me = LarkAuth(account_id).user_id
+        rows = st.context_messages(str(chat_id), None, None, None, 30)
+        last = next((r for r in reversed(rows) if str(r.sender_id) != str(me)), None) or (rows[-1] if rows else None)
+        if not last:
+            return {'prompt': '', 'note': '这个会话本地还没有消息'}
+        cfg = accounts.get_settings(account_id)
+        listener = self.listeners.get(account_id)
+        d = AgentDispatcher(None, None, cfg=cfg, account_id=account_id, storage=st)
+        live = getattr(listener, 'dispatcher', None) if listener else None
+        if live is not None:
+            d.context_mark = dict(live.context_mark)
+            d.memory_seen = dict(live.memory_seen)
+        msg = {'chat_id': str(chat_id), 'chat_type': last.chat_type, 'anchor': last.anchor or '', 'msg_id': last.msg_id,
+               'from_id': last.sender_id, 'content': last.content, 'create_time': last.create_time,
+               'parent_id': last.parent_id or '', '_chat_name': last.chat_name, '_sender_name': last.sender_name}
+        key = d.session_key_of(msg)
+        prompt = d.build_prompt(key, [msg], preview=True)
+        return {'prompt': prompt, 'note': f'以「{last.sender_name or last.sender_id}」的最新一条消息作为这一轮要处理的消息'}
 
     # ---------- 长期记忆、定时任务 ----------
     def memory(self, account_id: str, chat: str = '') -> dict:

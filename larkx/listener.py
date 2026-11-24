@@ -160,6 +160,7 @@ class Listener:
             self.dispatcher = AgentDispatcher(backend, reply_fn, cfg=cfg, account_id=self.account_id, storage=st)
             self.dispatcher.denied = lambda msg: self._deny(msg, reply_fn)
             self.dispatcher.accepted = self._ack
+            self.dispatcher.handled = self._handled
         log = self.log
         name_cache = {}
 
@@ -198,10 +199,8 @@ class Listener:
                 if is_own and sys.stderr.isatty():
                     line = f'\x1b[36m{line}\x1b[0m'
                 log.info(line)
-                # 补收回来的旧消息只入库: 不标已读(对方会看到已读回执),也不交给 agent
+                # 补收回来的旧消息只入库,也不交给 agent。已读不在这里标: 只有 agent 回复过的消息才标(见 _handled)
                 stale = catchup and is_stale(msg)
-                if cfg.get('mark_read') and not is_own and msg.get('position') and not stale:
-                    await asyncio.to_thread(client.mark_read, chat_id, msg['position'], [msg['msg_id']])
                 if self.dispatcher and not stale:
                     await self.dispatcher.submit(msg, chat_name=chat_name, sender_name=sender_name, my_user_id=auth.user_id, self_chat=typed_in_self_chat)
             return saved
@@ -347,6 +346,20 @@ class Listener:
             return
         anchor = msg.get('anchor') or ''
         await reply_fn(chat_id, text, anchor or None, None if anchor else msg.get('msg_id'))
+
+    async def _handled(self, msg: dict):
+        """「处理后标记已读」: agent 在这个会话里回复过才把对方这条标成已读;
+        没触发 agent、agent 决定不回的消息保持未读,手机上照常有未读提醒。"""
+        if not (self.cfg.get('mark_read') and msg.get('position') and msg.get('msg_id')):
+            return
+        if self._auth and str(msg.get('from_id')) == str(self._auth.user_id):
+            return
+        chat_id = str(msg.get('chat_id'))
+        try:
+            if await asyncio.to_thread(self.storage.has_outgoing_since, chat_id, int(msg.get('create_time') or 0)):
+                await asyncio.to_thread(self.client.mark_read, chat_id, msg['position'], [msg['msg_id']])
+        except Exception as e:
+            self.log.debug(f'标记已读失败: {e}')
 
     def _ack(self, msg: dict):
         """收到要处理的消息先点个 👌。注意:点在别人的消息上,那条消息会变成已读。"""

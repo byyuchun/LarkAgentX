@@ -234,6 +234,36 @@ function ChatInput({ accountId, value, onChange, single, groupsOnly, placeholder
   )
 }
 
+/** Agent 在这个会话里会收到的完整输入(以最新一条别人的消息为例),方便检查上下文给得对不对 */
+function ContextPreview({ accountId, chatId }: { accountId: string; chatId: string }) {
+  const [data, setData] = useState<{ prompt: string; note: string } | null>(null)
+  const [busy, setBusy] = useState(false)
+  const load = () => attempt(async () => {
+    setBusy(true)
+    try {
+      setData(await api<{ prompt: string; note: string }>('GET', `/accounts/${enc(accountId)}/context-preview?chat=${enc(chatId)}`))
+    } finally {
+      setBusy(false)
+    }
+  })
+  return (
+    <div className="flex flex-col gap-1.5">
+      <div className="flex items-center justify-between gap-2">
+        <div>
+          <div className="text-small font-medium">Agent 看到的内容</div>
+          <div className="text-caption text-fg-3">{data?.note || '按已保存的设置生成；改了说明要先保存再预览。'}</div>
+        </div>
+        <Button type="button" variant="ghost" size="sm" disabled={busy} onClick={() => void load()}>{data ? '刷新' : '预览'}</Button>
+      </div>
+      {data && (
+        <pre className="max-h-96 overflow-auto rounded-sm bg-surface-1 p-3 font-mono text-caption whitespace-pre-wrap break-words text-fg-2 ring-1 ring-line-1 ring-inset">
+          {data.prompt || '（空）'}
+        </pre>
+      )}
+    </div>
+  )
+}
+
 /** 一个会话自己的记忆: 展开后查看、添加、删除。改动立即生效,不用点保存 */
 function ChatMemory({ accountId, chatId }: { accountId: string; chatId: string }) {
   const [data, setData] = useState<MemoryData | null>(null)
@@ -252,7 +282,7 @@ function ChatMemory({ accountId, chatId }: { accountId: string; chatId: string }
   const remove = (n: number) => attempt(async () => setData(await api<MemoryData>('DELETE', `${base}/${n}${q}`)))
   if (!data) return <div className="px-1 py-2 text-caption text-fg-3">正在读取…</div>
   return (
-    <div className="flex flex-col gap-1.5 rounded-sm bg-fill-1 p-3">
+    <div className="flex flex-col gap-1.5 rounded-sm bg-surface-1 p-3 ring-1 ring-line-1 ring-inset">
       {data.entries.length ? data.entries.map((e, i) => (
         <div key={i} className="flex items-start gap-2 text-small">
           <span className="w-5 shrink-0 text-right text-fg-4">{i + 1}.</span>
@@ -290,11 +320,11 @@ function ConversationList({ accountId, value, configs, onChange }: { accountId: 
         .catch(() => undefined)
     }
   }, [value.join(','), base])
-  const cfgOf = (id: string): ChatConfig => configs.find((c) => c.chat_id === id) ?? { chat_id: id, workdir: '', senders: [] }
+  const cfgOf = (id: string): ChatConfig => ({ chat_id: id, workdir: '', senders: [], notes: '', ...configs.find((c) => c.chat_id === id) })
   const update = (id: string, patch: Partial<ChatConfig>) => {
     const next = { ...cfgOf(id), ...patch }
     const rest = configs.filter((c) => c.chat_id !== id)
-    onChange(value, next.workdir || next.senders.length ? [...rest, next] : rest)
+    onChange(value, next.workdir || next.senders.length || next.notes ? [...rest, next] : rest)
   }
   const remove = (id: string) => onChange(value.filter((x) => x !== id), configs.filter((c) => c.chat_id !== id))
 
@@ -313,7 +343,7 @@ function ConversationList({ accountId, value, configs, onChange }: { accountId: 
               </div>
               <Input value={cfgOf(id).workdir} onChange={(e) => update(id, { workdir: e.target.value })} placeholder="工作目录（可选），留空用全局工作目录" className="font-mono text-small" />
               <Button type="button" variant="ghost" size="sm" onClick={() => setOpen(open === id ? null : id)}>
-                记忆
+                上下文
                 <ChevronRight className={cn('size-3.5 transition-transform', open === id && 'rotate-90')} />
               </Button>
               <Button type="button" variant="ghost" aria-label={`移除 ${name}`} onClick={() => remove(id)}>
@@ -325,7 +355,23 @@ function ConversationList({ accountId, value, configs, onChange }: { accountId: 
                 <PeopleInput accountId={accountId} value={cfgOf(id).senders} onChange={(v) => update(id, { senders: v })} placeholder="只回复这些人（可选），留空回复群里所有人" />
               </div>
             )}
-            {open === id && <ChatMemory accountId={accountId} chatId={id} />}
+            {open === id && (
+              <div className="flex flex-col gap-3 rounded-sm bg-fill-1 p-3">
+                <Field label="会话说明" hint="这个会话是做什么的、Agent 要注意什么。会附在它收到的消息前面（内容变了才重新附）。点页面底部的保存生效。">
+                  <Textarea
+                    value={cfgOf(id).notes}
+                    maxLength={2000}
+                    onChange={(e) => update(id, { notes: e.target.value })}
+                    placeholder={t?.kind === 'group' ? '例如：这是支付服务的值班群，代码在工作目录里。先看报警链接和最近的发布，再给结论；不确定就说会找人确认。' : '例如：他是我的 mentor，回复要简洁，涉及排期的事先说会跟我确认。'}
+                  />
+                </Field>
+                <div>
+                  <div className="mb-1.5 text-small font-medium">记忆</div>
+                  <ChatMemory accountId={accountId} chatId={id} />
+                </div>
+                <ContextPreview accountId={accountId} chatId={id} />
+              </div>
+            )}
           </div>
         )
       })}
@@ -500,7 +546,7 @@ export function SettingsPage({ account: a }: { account: Account }) {
                   onChange={(v) => trig('self_chat_enabled', v)}
                 />
                 <SwitchRow title="群聊中只处理 @我 的消息" checked={s.triggers.group_at_only} onChange={(v) => trig('group_at_only', v)} />
-                <SwitchRow title="处理后标记已读" hint="同步清除手机端的未读角标。" checked={s.mark_read} onChange={(v) => set('mark_read', v)} />
+                <SwitchRow title="回复后标记已读" hint="Agent 回复过的消息标为已读，同步清除手机端的未读角标。没触发 Agent、或 Agent 没回复的消息保持未读。" checked={s.mark_read} onChange={(v) => set('mark_read', v)} />
                 <SwitchRow
                   title="收到消息先点个 👌"
                   hint="交给 Agent 处理的消息会先加一个 OK 表情。对方会看到这条消息已读，撤掉表情也不会恢复成未读。"

@@ -167,6 +167,11 @@ def build_router(mgr: Manager, auth_required: bool) -> APIRouter:
         except Exception as e:
             raise ValueError(f'获取私聊会话失败: {e}')
 
+    @r.get('/accounts/{account_id}/context-preview')
+    async def context_preview(account_id: str, chat: str = Query(..., max_length=64)):
+        """这个会话现在来一条消息时,agent 会收到的完整输入。"""
+        return await asyncio.to_thread(mgr.context_preview, account_id, chat)
+
     @r.get('/accounts/{account_id}/memory')
     async def get_memory(account_id: str, chat: str = Query('', max_length=64)):
         return mgr.memory(account_id, chat)
