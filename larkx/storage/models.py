@@ -78,3 +78,11 @@ class AgentSent(Base):
     __tablename__ = 'agent_sent'
     msg_id = Column(String(32), primary_key=True)
     chat_id = Column(String(32), default='')
+
+
+class ActiveTopic(Base):
+    """本人用前缀唤起 agent 后激活的话题: 话题内其他成员的后续提问可自动跟进。"""
+    __tablename__ = 'active_topics'
+    chat_id = Column(String(32), primary_key=True)
+    anchor = Column(String(32), primary_key=True)
+    activated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)

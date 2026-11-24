@@ -91,6 +91,8 @@ export interface Triggers {
   group_at_only: boolean
   dm_enabled: boolean
   self_chat_enabled: boolean
+  trigger_by: 'others' | 'owner' | 'all'
+  topic_followup: boolean
 }
 
 export interface Settings {
@@ -99,6 +101,7 @@ export interface Settings {
   agent_backend: string
   agent_model: string
   workdir: string
+  extra_workdirs: string[]
   agent_timeout: number
   system_prompt: string
   context_scope: string

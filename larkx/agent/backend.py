@@ -22,6 +22,7 @@ BACKENDS = {
     'pi': {'label': 'Pi', 'binary': 'pi'},
     'opencode': {'label': 'opencode', 'binary': 'opencode'},
     'cursor': {'label': 'Cursor CLI', 'binary': 'cursor-agent', 'alt': ('agent',)},
+    'agy': {'label': 'Antigravity CLI', 'binary': 'agy'},
     'none': {'label': '不接入 agent(仅入库)', 'binary': ''},
 }
 
@@ -71,7 +72,7 @@ def _kill_tree(proc):
 class AgentBackend:
     name = 'base'
 
-    async def run(self, session_key: str, prompt: str, chat_id: str='', anchor: str='', workdir: str=None) -> str:
+    async def run(self, session_key: str, prompt: str, chat_id: str='', anchor: str='', workdir: str=None, extra_dirs=None) -> str:
         raise NotImplementedError
 
     def reset_session(self, session_key: str):
@@ -147,7 +148,7 @@ class CliBackend(AgentBackend):
     def model_args(self) -> list:
         return []
 
-    def build_args(self, sess: dict) -> list:
+    def build_args(self, sess: dict, extra_dirs=()) -> list:
         raise NotImplementedError
 
     def prompt_args(self, prompt: str) -> list:
@@ -162,7 +163,7 @@ class CliBackend(AgentBackend):
         """会话 id 写在 stderr 里的 CLI(豆包)覆盖这个。"""
         return self.parse(stdout, sess)
 
-    async def run(self, session_key: str, prompt: str, chat_id: str='', anchor: str='', workdir: str=None) -> str:
+    async def run(self, session_key: str, prompt: str, chat_id: str='', anchor: str='', workdir: str=None, extra_dirs=None) -> str:
         skey = self._key(session_key)
         sess = self._session(skey, chat_id, anchor)
         exe = self._exe()
@@ -170,10 +171,25 @@ class CliBackend(AgentBackend):
             self.log.error(f'未找到 {self.binary} CLI,请确认已安装并在 PATH 中')
             return ''
         workdir = workdir or self.cfg.get('workdir') or None
+        if workdir:
+            workdir = os.path.expanduser(workdir)
         if workdir and not os.path.isdir(workdir):
             self.log.error(f'agent 工作目录不存在: {workdir}')
             return ''
-        args = [exe] + self.build_args(sess)
+        raw_extra = extra_dirs if extra_dirs is not None else (self.cfg.get('extra_workdirs') or ())
+        dirs = []
+        for d in raw_extra:
+            d = os.path.expanduser(str(d).strip())
+            if not d or d == workdir or d in dirs:
+                continue
+            if os.path.isdir(d):
+                dirs.append(d)
+            else:
+                self.log.warning(f'额外工作区目录不存在(已跳过): {d}')
+        # 没设主工作目录但配了额外工作区时,把第一个当作 cwd,其余作为 --add-dir
+        if not workdir and dirs:
+            workdir, dirs = dirs[0], dirs[1:]
+        args = [exe] + self.build_args(sess, dirs)
         preview = prompt.replace('\n', ' ')[:300]
         self.log.info(f'调 agent [{session_key}]: {" ".join(args)} << {preview}' + ('…' if len(prompt) > 300 else ''))
         extra = self.prompt_args(prompt)
@@ -249,9 +265,10 @@ class ClaudeCodeBackend(CliBackend):
         model = self.cfg.get('agent_model')
         return ['--model', model] if model else []
 
-    def build_args(self, sess: dict) -> list:
+    def build_args(self, sess: dict, extra_dirs=()) -> list:
         base = self.cmd_template.split()[1:] if self.cmd_template else CLAUDE_FLAGS
-        return base + self.model_args() + (['--resume', sess['id']] if sess['started'] else ['--session-id', sess['id']])
+        extra = [x for d in extra_dirs for x in ('--add-dir', str(d))]
+        return base + self.model_args() + extra + (['--resume', sess['id']] if sess['started'] else ['--session-id', sess['id']])
 
     def parse(self, stdout: str, sess: dict) -> tuple:
         return stdout, sess['id']
@@ -275,10 +292,11 @@ class CodexBackend(CliBackend):
         model = self.cfg.get('agent_model')
         return ['-m', model] if model else []
 
-    def build_args(self, sess: dict) -> list:
+    def build_args(self, sess: dict, extra_dirs=()) -> list:
         if sess['started'] and sess['id']:
             return ['exec', 'resume'] + CODEX_FLAGS + self.model_args() + [sess['id'], '-']
-        return ['exec'] + CODEX_FLAGS + self.model_args() + ['-']
+        extra = [x for d in extra_dirs for x in ('--add-dir', str(d))]
+        return ['exec'] + CODEX_FLAGS + extra + self.model_args() + ['-']
 
     def parse(self, stdout: str, sess: dict) -> tuple:
         thread_id, text = '', ''
@@ -468,10 +486,65 @@ class CursorBackend(CliBackend):
         return '', ''
 
 
+class AgyBackend(CliBackend):
+    """Antigravity CLI(agy)。prompt 经 -p=<prompt> 传入,--output-format json 返回带 conversation_id 和 response 的 JSON,续聊用 --resume <id>。"""
+    name = 'agy'
+    binary = 'agy'
+
+    def _new_session_id(self, session_key: str, stable: bool) -> str:
+        return ''
+
+    def _key(self, session_key: str) -> str:
+        return 'agy|' + session_key
+
+    def model_args(self) -> list:
+        model = self.cfg.get('agent_model')
+        return ['--model', model] if model else []
+
+    def build_args(self, sess: dict, extra_dirs=(), read_only: bool = False) -> list:
+        args = ['--output-format', 'json', '--dangerously-skip-permissions']
+        if read_only:
+            args += ['--mode', 'plan']
+        for d in extra_dirs:
+            args += ['--add-dir', str(d)]
+        if sess['started'] and sess['id']:
+            args += ['--resume', sess['id']]
+        return args + self.model_args()
+
+    def prompt_args(self, prompt: str) -> list:
+        return [f'-p={prompt}']
+
+    def parse(self, stdout: str, sess: dict) -> tuple:
+        ev = None
+        try:
+            parsed = json.loads(stdout)
+            if isinstance(parsed, dict):
+                ev = parsed
+        except ValueError:
+            pass
+        if ev is None:
+            for line in reversed(stdout.splitlines()):
+                try:
+                    parsed = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(parsed, dict) and ('conversation_id' in parsed or 'response' in parsed):
+                    ev = parsed
+                    break
+        if not ev:
+            return stdout, sess['id'] if sess['started'] else ''
+        status = str(ev.get('status') or '')
+        if status and status.upper() != 'SUCCESS':
+            detail = ev.get('error') or ev.get('response') or status
+            self.log.warning(f'agy 本轮未成功({status}): {str(detail)[:300]}')
+        cid = str(ev.get('conversation_id') or '') or (sess['id'] if sess['started'] else '')
+        return str(ev.get('response') or '').strip(), cid
+
+
 class NullBackend(AgentBackend):
     name = 'none'
 
-    async def run(self, session_key: str, prompt: str, chat_id: str='', anchor: str='', workdir: str=None) -> str:
+    async def run(self, session_key: str, prompt: str, chat_id: str='', anchor: str='', workdir: str=None, extra_dirs=None) -> str:
         return ''
 
 
@@ -482,7 +555,7 @@ def get_backend(name: str=None, storage=None, cfg: dict=None, account_id: str=No
     if name == 'claude':
         return ClaudeCodeBackend(storage=storage, cfg=cfg, account_id=account_id)
     cls = {'codex': CodexBackend, 'trae': TraeBackend, 'doubao': DoubaoBackend, 'pi': PiBackend,
-           'opencode': OpencodeBackend, 'cursor': CursorBackend}.get(name)
+           'opencode': OpencodeBackend, 'cursor': CursorBackend, 'agy': AgyBackend}.get(name)
     if cls:
         return cls(storage=storage, cfg=cfg, account_id=account_id)
     return NullBackend()

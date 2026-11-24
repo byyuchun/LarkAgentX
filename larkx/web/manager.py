@@ -258,6 +258,7 @@ class Manager:
             'agent_backend': cfg['agent_backend'],
             'agent_model': cfg['agent_model'],
             'workdir': cfg['workdir'],
+            'extra_workdirs': [str(d) for d in (cfg.get('extra_workdirs') or []) if str(d).strip()],
             'agent_timeout': cfg['agent_timeout'],
             'system_prompt': cfg['system_prompt'],
             'context_scope': cfg['context_scope'],
@@ -275,10 +276,19 @@ class Manager:
 
     def save_settings(self, account_id: str, data: dict) -> dict:
         account_id = self.require(account_id)
-        workdir = data['workdir'].strip()
+        workdir = os.path.expanduser(data['workdir'].strip()) if data['workdir'].strip() else ''
         if workdir and not os.path.isdir(workdir):
             raise ValueError(f'工作目录不存在: {workdir}')
-        data = {**data, 'workdir': workdir}
+        extra_workdirs = []
+        for raw in data.get('extra_workdirs') or []:
+            p = os.path.expanduser(str(raw).strip())
+            if not p:
+                continue
+            if not os.path.isdir(p):
+                raise ValueError(f'工作区目录不存在: {p}')
+            if p != workdir and p not in extra_workdirs:
+                extra_workdirs.append(p)
+        data = {**data, 'workdir': workdir, 'extra_workdirs': extra_workdirs}
         rows = []
         listed = {str(c) for c in (data.get('triggers') or {}).get('include_chats') or []}
         for row in data.get('chat_configs') or []:

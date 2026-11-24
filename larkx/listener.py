@@ -148,6 +148,57 @@ class Listener:
                 raise ListenerError('这个飞书账号已在本机其他地方运行（另一个数据目录或演示服务），同时运行会重复回复。请先停止另一处。')
             self.locks.append(user_lock)
         cfg = self.cfg
+        log = self.log
+        name_cache = {}
+
+        async def _save_fetched(m: dict, chat_id: str, chat_name: str):
+            m['chat_id'] = str(m.get('chat_id') or chat_id)
+            uid = str(m.get('from_id') or '')
+            sname = ''
+            if uid:
+                skey = (uid, m['chat_id'])
+                if skey not in name_cache:
+                    name_cache[skey] = await asyncio.to_thread(client.get_user_name, uid, m['chat_id'])
+                sname = name_cache.get(skey) or ''
+            st.save_message(m, sender_name=sname, chat_name=chat_name,
+                            direction='out' if uid == str(auth.user_id) else 'in')
+
+        async def prepare_context(msgs: list):
+            """交给 agent 前补齐可能缺失的上下文: 话题根消息、被引用消息,以及尚未同步的最近聊天记录(均只读,不标已读)。"""
+            if not msgs:
+                return
+            last = msgs[-1]
+            chat_id = str(last.get('chat_id') or '')
+            if not chat_id:
+                return
+            chat_name = name_cache.get(chat_id) or st.get_chat_name(chat_id) or ''
+            want_ids = []
+            for m in msgs:
+                mid_self = str(m.get('msg_id') or '')
+                for k in ('root_id', 'anchor', 'parent_id'):
+                    mid = str(m.get(k) or '')
+                    if mid and mid != mid_self and mid not in want_ids and not st.get_message(mid, chat_id):
+                        want_ids.append(mid)
+            if want_ids:
+                try:
+                    for fm in await asyncio.to_thread(client.messages_by_ids, want_ids):
+                        await _save_fetched(fm, chat_id, chat_name)
+                except Exception as e:
+                    log.debug(f'补拉根消息/引用消息失败(忽略): {e}')
+            # 若该会话在此消息之前本地没有任何记录(比如刚启动监听就在旧群/旧话题里 /ai),只读补拉最近 30 条
+            until = max(int(m.get('create_time') or 0) for m in msgs) or None
+            trigger_ids = {str(m.get('msg_id')) for m in msgs if m.get('msg_id')}
+            pos = int(last.get('position') or 0)
+            if pos > 1:
+                chat_existing = st.context_messages(chat_id, None, None, until, len(trigger_ids) + 1)
+                if not any(str(r.msg_id) not in trigger_ids for r in chat_existing):
+                    try:
+                        start = max(1, pos - 30)
+                        for pm in await asyncio.to_thread(client.pull_history, chat_id, list(range(start, pos))):
+                            await _save_fetched(pm, chat_id, chat_name)
+                    except Exception as e:
+                        log.debug(f'补拉最近历史失败(忽略): {e}')
+
         if self.agent:
             backend = get_backend(storage=st, cfg=cfg, account_id=self.account_id)
 
@@ -161,8 +212,7 @@ class Listener:
             self.dispatcher.denied = lambda msg: self._deny(msg, reply_fn)
             self.dispatcher.accepted = self._ack
             self.dispatcher.handled = self._handled
-        log = self.log
-        name_cache = {}
+            self.dispatcher.prepare_context = prepare_context
 
         async def on_message(msg, catchup=False):
             """返回这条是不是第一次入库。catchup: 补收回来的,发送时间太久的只入库不交给 agent。"""
@@ -182,13 +232,27 @@ class Listener:
                     name_cache[chat_id] = sender_name
                     st.update_chat_name(chat_id, sender_name, chat_type)
             chat_name = name_cache.get(chat_id) or ''
+            if not chat_name and chat_type == 1:
+                chat_name = st.get_chat_name(chat_id) or ''
+                if chat_name:
+                    name_cache[chat_id] = chat_name
+            stale = catchup and is_stale(msg)
             typed_in_self_chat = False
-            if is_own and chat_type == 1 and self.dispatcher and (cfg.get('triggers') or {}).get('self_chat_enabled'):
-                if await asyncio.to_thread(client.is_self_chat, chat_id):
+            typed_self_trigger = False
+            if is_own and self.dispatcher and not stale:
+                t = cfg.get('triggers') or {}
+                prefix = t.get('prefix') or ''
+                content_stripped = (msg.get('content') or '').strip()
+                want_self_chat = bool(chat_type == 1 and t.get('self_chat_enabled') and await asyncio.to_thread(client.is_self_chat, chat_id))
+                want_self_trigger = bool((not want_self_chat) and (t.get('trigger_by') or 'others') in ('owner', 'all') and prefix and content_stripped.startswith(prefix))
+                if want_self_chat or want_self_trigger:
                     # agent 的回复(lark send)和网页发的消息都按服务端 id 先落库;等落完,库里没有的才是用户亲手发的。
                     # 这一步挡的是死循环: agent 在这个会话里回复,回显回来不能再交给 agent
-                    await asyncio.sleep(self.SELF_ECHO_WAIT)
-                    typed_in_self_chat = not st.message_exists(msg['msg_id'], chat_id)
+                    if not st.message_exists(msg['msg_id'], chat_id):
+                        await asyncio.sleep(self.SELF_ECHO_WAIT)
+                    if not st.message_exists(msg['msg_id'], chat_id):
+                        typed_in_self_chat = want_self_chat
+                        typed_self_trigger = want_self_trigger
             saved = st.save_message(msg, sender_name=sender_name, chat_name=chat_name,
                                     direction='out' if is_own else 'in')
             if saved:
@@ -200,9 +264,9 @@ class Listener:
                     line = f'\x1b[36m{line}\x1b[0m'
                 log.info(line)
                 # 补收回来的旧消息只入库,也不交给 agent。已读不在这里标: 只有 agent 回复过的消息才标(见 _handled)
-                stale = catchup and is_stale(msg)
                 if self.dispatcher and not stale:
-                    await self.dispatcher.submit(msg, chat_name=chat_name, sender_name=sender_name, my_user_id=auth.user_id, self_chat=typed_in_self_chat)
+                    await self.dispatcher.submit(msg, chat_name=chat_name, sender_name=sender_name, my_user_id=auth.user_id,
+                                                 self_chat=typed_in_self_chat, self_trigger=typed_self_trigger)
             return saved
 
         self._on_message, self._auth = on_message, auth

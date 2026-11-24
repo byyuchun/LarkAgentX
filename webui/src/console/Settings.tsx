@@ -385,6 +385,40 @@ function ConversationList({ accountId, value, configs, onChange }: { accountId: 
   )
 }
 
+function WorkdirList({ value, onChange }: { value: string[]; onChange: (v: string[]) => void }) {
+  const [draft, setDraft] = useState('')
+  const add = () => {
+    const p = draft.trim()
+    if (!p) return
+    if (!value.includes(p)) onChange([...value, p])
+    setDraft('')
+  }
+  return (
+    <div className="flex flex-col gap-2">
+      {value.map((dir) => (
+        <div key={dir} className="flex items-center gap-2">
+          <div className="min-w-0 flex-1 truncate rounded-sm bg-fill-1 px-3 py-1.5 font-mono text-small text-fg-1 ring-1 ring-line-1 ring-inset" title={dir}>
+            {dir}
+          </div>
+          <Button type="button" variant="ghost" aria-label={`移除 ${dir}`} onClick={() => onChange(value.filter((x) => x !== dir))}>
+            <Trash2 className="size-4" />
+          </Button>
+        </div>
+      ))}
+      <div className="flex gap-2">
+        <Input
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onKeyDown={(e) => { if (e.key === 'Enter' && !e.nativeEvent.isComposing) { e.preventDefault(); add() } }}
+          placeholder="输入本地目录路径，回车添加，例如 ~/work/my-repo"
+          className="font-mono text-small"
+        />
+        <Button type="button" variant="ghost" size="sm" disabled={!draft.trim()} onClick={add}>添加</Button>
+      </div>
+    </div>
+  )
+}
+
 function Section({ id, title, note, children }: { id: string; title: string; note?: string; children: ReactNode }) {
   return (
     <section id={`s-${id}`} className="scroll-mt-6">
@@ -517,6 +551,9 @@ export function SettingsPage({ account: a }: { account: Account }) {
               <Field label="工作目录（可选）" hint="Agent 在此目录下运行，可读写其中的文件。">
                 <Input value={s.workdir} onChange={(e) => set('workdir', e.target.value)} placeholder="留空用控制台所在目录" className="font-mono text-small" />
               </Field>
+              <Field label="额外工作区（可选）" hint="可添加多个本地代码仓库或目录，会一并传给 Agent（--add-dir）并在提示词中列出。">
+                <WorkdirList value={s.extra_workdirs} onChange={(v) => set('extra_workdirs', v)} />
+              </Field>
               <Field label="系统提示词（可选）">
                 <Textarea value={s.system_prompt} onChange={(e) => set('system_prompt', e.target.value)} placeholder="留空用内置默认" />
               </Field>
@@ -584,14 +621,52 @@ export function SettingsPage({ account: a }: { account: Account }) {
             </Card>
           </Section>
 
-          <Section id="triggers" title="触发规则" note="留空则处理所有消息，多个条件需同时满足。你发给他人的消息不会触发。">
+          <Section id="triggers" title="触发规则" note="留空则处理所有消息，多个条件需同时满足。">
             <Card className="flex flex-col gap-4 p-5">
               <div className="grid gap-4 sm:grid-cols-2">
-                <Field label="前缀"><Input value={s.triggers.prefix} maxLength={64} onChange={(e) => trig('prefix', e.target.value)} placeholder="例如 /run" /></Field>
+                <Field label="前缀"><Input value={s.triggers.prefix} maxLength={64} onChange={(e) => trig('prefix', e.target.value)} placeholder="例如 /ai" /></Field>
                 <div className="flex flex-col gap-1.5">
                   <span className="text-small font-medium">关键词</span>
                   <TagInput value={s.triggers.keywords} onChange={(v) => trig('keywords', v)} placeholder="命中任一即可，回车添加" />
                 </div>
+              </div>
+              <div className="flex flex-col gap-2 border-y border-line-1 py-3">
+                <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
+                  <div className="min-w-0">
+                    <div className="text-body font-medium">触发对象</div>
+                    <div className="text-caption text-fg-3">
+                      {s.triggers.trigger_by === 'owner'
+                        ? '无论群聊还是私聊，只有你本人亲手发带前缀的消息才触发 Agent，他人消息仅保存为上下文。'
+                        : s.triggers.trigger_by === 'all'
+                          ? '他人满足规则的消息，以及你本人亲手发带前缀的消息，都会触发 Agent。'
+                          : '只处理他人发来的消息；你发给他人的消息不会触发。'}
+                    </div>
+                  </div>
+                  <Seg
+                    value={s.triggers.trigger_by}
+                    onChange={(v) => trig('trigger_by', v as Triggers['trigger_by'])}
+                    options={[
+                      { value: 'others', label: '仅他人' },
+                      { value: 'owner', label: '仅自己' },
+                      { value: 'all', label: '自己和他人' },
+                    ]}
+                  />
+                </div>
+                {s.triggers.trigger_by !== 'others' && !s.triggers.prefix && (
+                  <p className="rounded-sm bg-warning-soft px-3 py-1.5 text-caption text-warning">
+                    自己触发需要先在上方设置「前缀」（例如 /ai），否则你发给他人的消息不会触发。
+                  </p>
+                )}
+                {s.triggers.trigger_by !== 'others' && (
+                  <div className="border-t border-line-1 pt-1">
+                    <SwitchRow
+                      title="话题内自动跟进他人提问"
+                      hint="用前缀唤起 Agent 并开话题回复后，同一话题内其他成员的后续提问也会自动交给 Agent（感谢或闲聊不回复；话题内发 /end 可结束跟进）。"
+                      checked={s.triggers.topic_followup}
+                      onChange={(v) => trig('topic_followup', v)}
+                    />
+                  </div>
+                )}
               </div>
               <div className="flex flex-col gap-1.5">
                 <div>

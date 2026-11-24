@@ -36,6 +36,8 @@ class TriggersIn(BaseModel):
     group_at_only: bool = False
     dm_enabled: bool = True              # 别人私聊我时是否处理
     self_chat_enabled: bool = False      # 「和自己的会话」里亲手发的是否处理
+    trigger_by: Literal['others', 'owner', 'all'] = 'others'   # 触发对象: 仅他人 | 仅自己(需前缀) | 自己和他人
+    topic_followup: bool = True          # 本人带前缀唤起话题后,话题内他人的后续提问自动跟进
 
 
 class ChatConfigIn(BaseModel):
@@ -49,10 +51,11 @@ class ChatConfigIn(BaseModel):
 class SettingsIn(BaseModel):
     remark: str = Field('', max_length=40)                # 备注名,可留空(留空显示飞书里的姓名)
     autostart: bool = False
-    agent_backend: Literal['claude', 'codex', 'trae', 'doubao', 'pi', 'opencode', 'cursor', 'none']
+    agent_backend: Literal['claude', 'codex', 'trae', 'doubao', 'pi', 'opencode', 'cursor', 'agy', 'none']
     # 模型名会作为命令行参数传给 agent CLI,不允许以 - 开头,免得被当成别的开关
     agent_model: str = Field('', max_length=100, pattern=r'^([A-Za-z0-9][A-Za-z0-9_.:/-]*)?$')
     workdir: str = Field('', max_length=500)
+    extra_workdirs: List[str] = Field(default_factory=list, max_length=50)
     agent_timeout: int = Field(7200, ge=0, le=86400)        # 秒;0 = 不限
     system_prompt: str = Field('', max_length=8000)
     context_scope: Literal['anchor', 'chat', 'global'] = 'anchor'

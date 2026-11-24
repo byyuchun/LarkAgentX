@@ -20,6 +20,7 @@ DEFAULTS = {
     "agent_backend": "claude",
     "agent_model": "",
     "workdir": "",
+    "extra_workdirs": [],      # 额外工作区目录列表(传给支持的 agent CLI --add-dir,并在提示词里列出)
     "agent_timeout": 7200,
     "system_prompt": "",
     "mark_read": True,
@@ -42,11 +43,13 @@ DEFAULTS = {
         "group_at_only": False,
         "dm_enabled": True,
         "self_chat_enabled": False,
+        "trigger_by": "others",    # others: 仅他人 | owner: 仅本人带前缀 | all: 自己和他人
+        "topic_followup": True,    # 本人带前缀唤起话题后,话题内他人的后续提问是否自动跟进
     },
 }
 
 # 可以按账号覆盖(web 里设置)的配置项
-SETTING_KEYS = ("agent_backend", "agent_model", "workdir", "agent_timeout", "system_prompt", "context_scope", "mark_read", "reply_in_topic",
+SETTING_KEYS = ("agent_backend", "agent_model", "workdir", "extra_workdirs", "agent_timeout", "system_prompt", "context_scope", "mark_read", "reply_in_topic",
                 "reply_mode", "reply_signature", "ack_reaction", "deny_reply", "memory_enabled", "memory_review_at", "triggers",
                 "chat_configs")
 
@@ -61,6 +64,8 @@ TRIGGER_ENV = {
     "group_at_only": "LARKX_TRIGGER_GROUP_AT_ONLY",
     "dm_enabled": "LARKX_TRIGGER_DM_ENABLED",
     "self_chat_enabled": "LARKX_TRIGGER_SELF_CHAT_ENABLED",
+    "trigger_by": "LARKX_TRIGGER_BY",
+    "topic_followup": "LARKX_TRIGGER_TOPIC_FOLLOWUP",
 }
 
 
@@ -93,7 +98,7 @@ def load_config(overrides: dict = None) -> dict:
             continue
         v = os.environ.get("LARKX_" + key.upper())
         if v:
-            cfg[key] = v
+            cfg[key] = _as_list(v) if isinstance(DEFAULTS[key], list) else v
     for flag in ("mark_read", "reply_in_topic", "ack_reaction", "memory_enabled"):
         if isinstance(cfg.get(flag), str):
             cfg[flag] = _as_bool(cfg[flag])
@@ -102,7 +107,7 @@ def load_config(overrides: dict = None) -> dict:
         v = os.environ.get(env_name)
         if v is None:
             continue
-        if key in ("group_at_only", "dm_enabled", "self_chat_enabled"):
+        if key in ("group_at_only", "dm_enabled", "self_chat_enabled", "topic_followup"):
             triggers[key] = _as_bool(v)
         elif isinstance(DEFAULTS["triggers"][key], list):
             triggers[key] = _as_list(v)
@@ -114,5 +119,9 @@ def load_config(overrides: dict = None) -> dict:
             cfg["triggers"] = {**triggers, **v}
         elif key in SETTING_KEYS:
             cfg[key] = v
+    if cfg["triggers"].get("trigger_by") not in ("others", "owner", "all"):
+        cfg["triggers"]["trigger_by"] = "others"
+    if not isinstance(cfg.get("extra_workdirs"), list):
+        cfg["extra_workdirs"] = []
     cfg["agent_timeout"] = _as_seconds(cfg.get("agent_timeout"))
     return cfg

@@ -4,7 +4,7 @@ from sqlalchemy import and_, create_engine, desc, exists, func, or_
 from sqlalchemy.orm import aliased, sessionmaker
 from .. import accounts
 from ..config import load_config
-from .models import AgentSent, AgentSession, Base, Chat, Message, PendingMessage, Task
+from .models import ActiveTopic, AgentSent, AgentSession, Base, Chat, Message, PendingMessage, Task
 
 
 def _json_default(o):
@@ -442,6 +442,44 @@ class Storage:
         s = self.Session()
         try:
             return {r.msg_id for r in s.query(AgentSent.msg_id).filter(AgentSent.msg_id.in_(msg_ids)).all()}
+        finally:
+            s.close()
+
+    # ---- 本人激活的话题(话题内自动跟进他人提问) ----
+    def topic_activate(self, chat_id: str, anchor: str):
+        chat_id, anchor = str(chat_id or ''), str(anchor or '')
+        if not chat_id or not anchor:
+            return
+        s = self.Session()
+        try:
+            row = s.query(ActiveTopic).filter_by(chat_id=chat_id, anchor=anchor).first()
+            if row:
+                row.activated_at = datetime.now()
+            else:
+                s.add(ActiveTopic(chat_id=chat_id, anchor=anchor))
+            s.commit()
+        finally:
+            s.close()
+
+    def topic_deactivate(self, chat_id: str, anchor: str) -> bool:
+        chat_id, anchor = str(chat_id or ''), str(anchor or '')
+        if not chat_id or not anchor:
+            return False
+        s = self.Session()
+        try:
+            n = s.query(ActiveTopic).filter_by(chat_id=chat_id, anchor=anchor).delete()
+            s.commit()
+            return n > 0
+        finally:
+            s.close()
+
+    def topic_is_active(self, chat_id: str, anchor: str) -> bool:
+        chat_id, anchor = str(chat_id or ''), str(anchor or '')
+        if not chat_id or not anchor:
+            return False
+        s = self.Session()
+        try:
+            return s.query(ActiveTopic.anchor).filter_by(chat_id=chat_id, anchor=anchor).first() is not None
         finally:
             s.close()
 
