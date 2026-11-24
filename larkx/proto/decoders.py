@@ -67,10 +67,10 @@ def extract_rich_text(rich_text_dict):
     引用、代码块等块级元素,文字在叶子里),都按 childIds 递归。块级元素之间补换行,列表项补「- 」或「n. 」,
     代码块取代码内容,链接取地址(自定义文字的链接写成「文字(地址)」)。解码失败的元素用占位符。
     """
-    TAG_PLACEHOLDERS = {2: '[图片]', 10: '[表情]', 18: '[视频]', 22: '[文档]'}
+    TAG_PLACEHOLDERS = {10: '[表情]', 18: '[视频]', 22: '[文档]'}
     TEXT_TAGS = (1, 7, 8, 9, 17, 23, 24, 25, 44, 45, 46)
     BLOCK_TAGS = (3, 26, 27, 28, 29, 31, 37, 23, 24, 25, 44, 45, 46)
-    AT, LINK, OL, LI, CODE, CODE_V2, PARA = 5, 6, 27, 28, 31, 37, 3
+    IMAGE, AT, LINK, OL, LI, CODE, CODE_V2, PARA = 2, 5, 6, 27, 28, 31, 37, 3
     text = ''
     try:
         E = _lark_all().entities.RichTextElement
@@ -83,6 +83,10 @@ def extract_rich_text(rich_text_dict):
             try:
                 if tag in TEXT_TAGS or tag == PARA:
                     text += P.TextProperty.FromString(prop).content
+                elif tag == IMAGE:
+                    ip = E.ImageProperty.FromString(prop)
+                    key = ip.originKey or ip.token or ip.middleKey
+                    text += f'[图片 imageKey={key}]' if key else '[图片]'
                 elif tag == AT:
                     text += P.AtProperty.FromString(prop).content or '[@]'
                 elif tag == LINK:

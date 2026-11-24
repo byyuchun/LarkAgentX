@@ -1,6 +1,7 @@
 import mimetypes
 import os
 import re
+import time
 import zlib
 from pathlib import Path
 
@@ -9,6 +10,54 @@ from loguru import logger
 from .auth import LarkAuth
 from .config import load_config
 from .region import get_region
+
+_IMG_KEY_RE = re.compile(r'imageKey=([\w\-.]{6,200})')
+_CTYPE_EXT = {'image/jpeg': '.jpg', 'image/jpg': '.jpg', 'image/png': '.png', 'image/webp': '.webp', 'image/gif': '.gif'}
+MEDIA_CACHE_TTL = 7 * 86400
+MAX_AUTO_IMAGE = 20 * 1024 * 1024
+
+
+def extract_image_keys(content: str = '', msg_type: int = 0, content_data: dict = None) -> list:
+    """从消息文本([图片] imageKey=... / 富文本内嵌 [图片 imageKey=...])和 content_data 中提取所有图片 key(去重保序)。"""
+    keys = []
+    for k in _IMG_KEY_RE.findall(str(content or '')):
+        if k not in keys:
+            keys.append(k)
+    if msg_type == 5 and isinstance(content_data, dict):
+        k = extract_resource_key(5, content_data)
+        if k and k not in keys:
+            keys.append(k)
+    return keys
+
+
+def cache_image(auth: LarkAuth, chat_id: str, msg_id: str, key: str, cache_dir: Path) -> str:
+    """下载消息里的图片到缓存目录(已有直接复用,顺带清理超过 7 天的旧图),返回本地绝对路径。"""
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    safe_key = re.sub(r'[^\w\-.]', '_', str(key))
+    prefix = f'{msg_id}_{safe_key}'
+    for existing in cache_dir.glob(prefix + '.*'):
+        if existing.is_file() and existing.stat().st_size > 0:
+            return str(existing)
+    url = message_resource_url(str(msg_id), str(key), str(chat_id), host=auth.region.file_host)
+    buf, ctype = download(auth, url, out_path=None, max_bytes=MAX_AUTO_IMAGE)
+    if not buf:
+        raise ValueError('下载图片为空')
+    mime = (ctype or '').split(';', 1)[0].strip().lower()
+    ext = _CTYPE_EXT.get(mime) or mimetypes.guess_extension(mime) or '.png'
+    out = cache_dir / f'{prefix}{ext}'
+    tmp = out.with_suffix(ext + '.tmp')
+    tmp.write_bytes(buf)
+    os.replace(tmp, out)
+    # 顺手清理过期的旧缓存图,忽略个别删除失败
+    cutoff = time.time() - MEDIA_CACHE_TTL
+    try:
+        for p in cache_dir.iterdir():
+            if p.is_file() and p != out and p.stat().st_mtime < cutoff:
+                p.unlink(missing_ok=True)
+    except Exception:
+        pass
+    return str(out)
 
 
 def message_resource_url(msg_id: str, key: str, chat_id: str, host: str=None) -> str:

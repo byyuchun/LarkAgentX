@@ -548,6 +548,23 @@ export function SettingsPage({ account: a }: { account: Account }) {
                   </div>
                 </Field>
               </div>
+              {s.agent_backend === 'agy' && (
+                <div>
+                  <div className="mb-1.5 text-small font-medium">推理强度（Effort）</div>
+                  <Seg
+                    value={s.agent_effort}
+                    onChange={(v) => set('agent_effort', v as Settings['agent_effort'])}
+                    options={[
+                      { value: '', label: 'CLI 默认' },
+                      { value: 'low', label: 'Low' },
+                      { value: 'medium', label: 'Medium' },
+                      { value: 'high', label: 'High' },
+                      { value: 'xhigh', label: 'XHigh' },
+                    ]}
+                  />
+                  <p className="mt-1.5 text-caption text-fg-3">传给 agy --effort。日常排障建议 High，速度与准确度最均衡。</p>
+                </div>
+              )}
               <Field label="工作目录（可选）" hint="Agent 在此目录下运行，可读写其中的文件。">
                 <Input value={s.workdir} onChange={(e) => set('workdir', e.target.value)} placeholder="留空用控制台所在目录" className="font-mono text-small" />
               </Field>
@@ -617,6 +634,14 @@ export function SettingsPage({ account: a }: { account: Account }) {
                     options={[{ value: 'direct', label: '直接发送' }, { value: 'quote', label: '引用回复' }, { value: 'thread', label: '开话题回复' }]}
                   />
                 </div>
+                {s.reply_mode === 'thread' && (
+                  <SwitchRow
+                    title="引用他人消息时挂在原消息下开话题"
+                    hint="在群主会话里引用别人发的问题再发前缀时，直接以对方的原消息为根开话题，方便大家聚在原问题下讨论。"
+                    checked={s.reply_thread_on_quote}
+                    onChange={(v) => set('reply_thread_on_quote', v)}
+                  />
+                )}
               </div>
             </Card>
           </Section>
@@ -625,10 +650,23 @@ export function SettingsPage({ account: a }: { account: Account }) {
             <Card className="flex flex-col gap-4 p-5">
               <div className="grid gap-4 sm:grid-cols-2">
                 <Field label="前缀"><Input value={s.triggers.prefix} maxLength={64} onChange={(e) => trig('prefix', e.target.value)} placeholder="例如 /ai" /></Field>
-                <div className="flex flex-col gap-1.5">
-                  <span className="text-small font-medium">关键词</span>
-                  <TagInput value={s.triggers.keywords} onChange={(v) => trig('keywords', v)} placeholder="命中任一即可，回车添加" />
+                <Field label="私密草稿前缀（可选）" hint="在任意群/私聊发此前缀，查完上下文后只私发到「和自己的会话」，不在原群回复。">
+                  <Input value={s.triggers.draft_prefix} maxLength={64} onChange={(e) => trig('draft_prefix', e.target.value)} placeholder="例如 /me，留空关闭" />
+                </Field>
+              </div>
+              {s.triggers.draft_prefix && (
+                <div className="border-t border-line-1 pt-1">
+                  <SwitchRow
+                    title="私密草稿触发后自动撤回原指令"
+                    hint={`在群聊或他人私聊里发「${s.triggers.draft_prefix} ...」后，自动撤回你在原会话发出的那条指令消息。`}
+                    checked={s.triggers.draft_auto_recall}
+                    onChange={(v) => trig('draft_auto_recall', v)}
+                  />
                 </div>
+              )}
+              <div className="flex flex-col gap-1.5">
+                <span className="text-small font-medium">关键词</span>
+                <TagInput value={s.triggers.keywords} onChange={(v) => trig('keywords', v)} placeholder="命中任一即可，回车添加" />
               </div>
               <div className="flex flex-col gap-2 border-y border-line-1 py-3">
                 <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
@@ -658,13 +696,21 @@ export function SettingsPage({ account: a }: { account: Account }) {
                   </p>
                 )}
                 {s.triggers.trigger_by !== 'others' && (
-                  <div className="border-t border-line-1 pt-1">
+                  <div className="divide-y divide-line-1 border-t border-line-1 pt-1">
                     <SwitchRow
                       title="话题内自动跟进他人提问"
                       hint="用前缀唤起 Agent 并开话题回复后，同一话题内其他成员的后续提问也会自动交给 Agent（感谢或闲聊不回复；话题内发 /end 可结束跟进）。"
                       checked={s.triggers.topic_followup}
                       onChange={(v) => trig('topic_followup', v)}
                     />
+                    {s.triggers.topic_followup && (
+                      <SwitchRow
+                        title="他人追问时只读保护本地代码"
+                        hint="话题内由其他成员触发的回复强制走只读约束，禁止改写本地代码仓库，避免弄脏正在开发中的未提交文件。"
+                        checked={s.triggers.followup_read_only}
+                        onChange={(v) => trig('followup_read_only', v)}
+                      />
+                    )}
                   </div>
                 )}
               </div>

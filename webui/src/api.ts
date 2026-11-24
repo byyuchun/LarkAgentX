@@ -82,6 +82,8 @@ export interface Message {
 
 export interface Triggers {
   prefix: string
+  draft_prefix: string
+  draft_auto_recall: boolean
   chat_types: string[]
   include_chats: string[]
   exclude_chats: string[]
@@ -93,6 +95,7 @@ export interface Triggers {
   self_chat_enabled: boolean
   trigger_by: 'others' | 'owner' | 'all'
   topic_followup: boolean
+  followup_read_only: boolean
 }
 
 export interface Settings {
@@ -100,6 +103,7 @@ export interface Settings {
   autostart: boolean
   agent_backend: string
   agent_model: string
+  agent_effort: '' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
   workdir: string
   extra_workdirs: string[]
   agent_timeout: number
@@ -108,6 +112,7 @@ export interface Settings {
   mark_read: boolean
   reply_in_topic: boolean
   reply_mode: string
+  reply_thread_on_quote: boolean
   reply_signature: string
   ack_reaction: boolean
   deny_reply: string
@@ -172,6 +177,7 @@ export interface LogLine {
   seq: number
   time: string
   level: string
+  kind?: string
   text: string
 }
 

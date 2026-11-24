@@ -5,6 +5,7 @@ import shutil
 import signal
 import subprocess
 import sysconfig
+import time
 import uuid
 
 from loguru import logger
@@ -72,7 +73,7 @@ def _kill_tree(proc):
 class AgentBackend:
     name = 'base'
 
-    async def run(self, session_key: str, prompt: str, chat_id: str='', anchor: str='', workdir: str=None, extra_dirs=None) -> str:
+    async def run(self, session_key: str, prompt: str, chat_id: str='', anchor: str='', workdir: str=None, extra_dirs=None, read_only: bool=False) -> str:
         raise NotImplementedError
 
     def reset_session(self, session_key: str):
@@ -86,10 +87,11 @@ class AgentBackend:
 class CliBackend(AgentBackend):
     """把 prompt 经 stdin 交给本地 coding agent CLI,按 session_key 持久续聊。子类只管命令行和输出解析。"""
     binary = ''
+    stream_stdout = False
 
     def __init__(self, storage=None, cfg: dict=None, account_id: str=None):
         self.account_id = accounts.normalize(account_id)
-        self.log = logger.bind(account=self.account_id)
+        self.log = logger.bind(account=self.account_id, kind='agent')
         self.cfg = cfg if cfg is not None else accounts.get_settings(self.account_id)
         if storage is None:
             from ..storage import Storage
@@ -148,7 +150,7 @@ class CliBackend(AgentBackend):
     def model_args(self) -> list:
         return []
 
-    def build_args(self, sess: dict, extra_dirs=()) -> list:
+    def build_args(self, sess: dict, extra_dirs=(), read_only: bool = False) -> list:
         raise NotImplementedError
 
     def prompt_args(self, prompt: str) -> list:
@@ -163,7 +165,36 @@ class CliBackend(AgentBackend):
         """会话 id 写在 stderr 里的 CLI(豆包)覆盖这个。"""
         return self.parse(stdout, sess)
 
-    async def run(self, session_key: str, prompt: str, chat_id: str='', anchor: str='', workdir: str=None, extra_dirs=None) -> str:
+    def on_stdout_line(self, session_key: str, line: str):
+        """流式输出后端(stream_stdout=True)每读到一行 stdout 时调用,用来实时打印进度日志。"""
+
+    async def _run_proc(self, proc, stdin_data: bytes, session_key: str) -> tuple:
+        if not self.stream_stdout:
+            return await proc.communicate(stdin_data)
+        if proc.stdin:
+            if stdin_data:
+                proc.stdin.write(stdin_data)
+                await proc.stdin.drain()
+            proc.stdin.close()
+        err_task = asyncio.create_task(proc.stderr.read()) if proc.stderr else None
+        lines = []
+        if proc.stdout:
+            while True:
+                raw = await proc.stdout.readline()
+                if not raw:
+                    break
+                lines.append(raw)
+                text = raw.decode('utf-8', errors='replace').strip()
+                if text:
+                    try:
+                        self.on_stdout_line(session_key, text)
+                    except Exception:
+                        pass
+        stderr = await err_task if err_task else b''
+        await proc.wait()
+        return b''.join(lines), stderr
+
+    async def run(self, session_key: str, prompt: str, chat_id: str='', anchor: str='', workdir: str=None, extra_dirs=None, read_only: bool=False) -> str:
         skey = self._key(session_key)
         sess = self._session(skey, chat_id, anchor)
         exe = self._exe()
@@ -189,7 +220,7 @@ class CliBackend(AgentBackend):
         # 没设主工作目录但配了额外工作区时,把第一个当作 cwd,其余作为 --add-dir
         if not workdir and dirs:
             workdir, dirs = dirs[0], dirs[1:]
-        args = [exe] + self.build_args(sess, dirs)
+        args = [exe] + self.build_args(sess, dirs, read_only=read_only)
         preview = prompt.replace('\n', ' ')[:300]
         self.log.info(f'调 agent [{session_key}]: {" ".join(args)} << {preview}' + ('…' if len(prompt) > 300 else ''))
         extra = self.prompt_args(prompt)
@@ -198,6 +229,7 @@ class CliBackend(AgentBackend):
         # 告诉 agent 里调用的 lark 命令:这是 agent 发的(加署名、标记),在哪个会话里(定时任务记到这个会话)
         env = {**os.environ, 'PATH': _agent_path(), 'LARKX_AGENT': '1', 'LARKX_ACCOUNT': self.account_id,
                'LARKX_CHAT_ID': chat_id or '', 'LARKX_ANCHOR': anchor or ''}
+        t0 = time.monotonic()
         try:
             proc = await asyncio.create_subprocess_exec(
                 *args,
@@ -206,6 +238,7 @@ class CliBackend(AgentBackend):
                 stderr=subprocess.PIPE,
                 cwd=workdir,
                 env=env,
+                limit=4 * 1024 * 1024,      # stream-json 单行 JSON 可能超过默认 64KB
                 start_new_session=True,     # 非 Windows: 自成一个进程组,结束时整组杀掉(Windows 上忽略)
             )
         except FileNotFoundError:
@@ -213,7 +246,7 @@ class CliBackend(AgentBackend):
             return ''
         timeout = int(self.cfg.get('agent_timeout') or 0) or None
         try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(stdin_data), timeout)
+            stdout, stderr = await asyncio.wait_for(self._run_proc(proc, stdin_data, session_key), timeout)
         except asyncio.TimeoutError:
             _kill_tree(proc)
             await proc.wait()
@@ -225,16 +258,19 @@ class CliBackend(AgentBackend):
             _kill_tree(proc)
             self._abandon_first_turn(skey, sess, chat_id, anchor)
             raise
+        elapsed = time.monotonic() - t0
         out = stdout.decode('utf-8', errors='replace').strip()
         if proc.returncode != 0:
             err = stderr.decode('utf-8', errors='replace').strip()
-            self.log.error(f'agent 返回非零({proc.returncode}): {err[-500:]}')
+            self.log.error(f'agent 返回非零({proc.returncode}, {elapsed:.1f}s) [{session_key}]: {err[-500:]}')
             self._abandon_first_turn(skey, sess, chat_id, anchor)
             return ''
         text, agent_sid = self.parse_output(out, stderr.decode('utf-8', errors='replace'), sess)
         if agent_sid and ((not sess['started']) or agent_sid != sess['id']):
             self.storage.session_upsert(skey, chat_id, anchor, agent_sid, True)
         self.storage.session_touch(skey)
+        if not self.stream_stdout:
+            self.log.info(f'agent 完成 [{session_key}] ({elapsed:.1f}s)')
         return text
 
     def _abandon_first_turn(self, skey: str, sess: dict, chat_id: str, anchor: str):
@@ -265,10 +301,11 @@ class ClaudeCodeBackend(CliBackend):
         model = self.cfg.get('agent_model')
         return ['--model', model] if model else []
 
-    def build_args(self, sess: dict, extra_dirs=()) -> list:
+    def build_args(self, sess: dict, extra_dirs=(), read_only: bool = False) -> list:
         base = self.cmd_template.split()[1:] if self.cmd_template else CLAUDE_FLAGS
         extra = [x for d in extra_dirs for x in ('--add-dir', str(d))]
-        return base + self.model_args() + extra + (['--resume', sess['id']] if sess['started'] else ['--session-id', sess['id']])
+        ro = ['--disallowed-tools', 'Edit,Write,NotebookEdit'] if read_only else []
+        return base + self.model_args() + extra + ro + (['--resume', sess['id']] if sess['started'] else ['--session-id', sess['id']])
 
     def parse(self, stdout: str, sess: dict) -> tuple:
         return stdout, sess['id']
@@ -292,7 +329,7 @@ class CodexBackend(CliBackend):
         model = self.cfg.get('agent_model')
         return ['-m', model] if model else []
 
-    def build_args(self, sess: dict, extra_dirs=()) -> list:
+    def build_args(self, sess: dict, extra_dirs=(), read_only: bool = False) -> list:
         if sess['started'] and sess['id']:
             return ['exec', 'resume'] + CODEX_FLAGS + self.model_args() + [sess['id'], '-']
         extra = [x for d in extra_dirs for x in ('--add-dir', str(d))]
@@ -487,9 +524,10 @@ class CursorBackend(CliBackend):
 
 
 class AgyBackend(CliBackend):
-    """Antigravity CLI(agy)。prompt 经 -p=<prompt> 传入,--output-format json 返回带 conversation_id 和 response 的 JSON,续聊用 --resume <id>。"""
+    """Antigravity CLI(agy)。prompt 经 -p=<prompt> 传入,--output-format stream-json 实时流式输出步骤与最终结果,续聊用 --resume <id>。"""
     name = 'agy'
     binary = 'agy'
+    stream_stdout = True
 
     def _new_session_id(self, session_key: str, stable: bool) -> str:
         return ''
@@ -498,13 +536,18 @@ class AgyBackend(CliBackend):
         return 'agy|' + session_key
 
     def model_args(self) -> list:
+        args = []
         model = self.cfg.get('agent_model')
-        return ['--model', model] if model else []
+        if model:
+            args += ['--model', model]
+        effort = self.cfg.get('agent_effort')
+        if effort:
+            args += ['--effort', effort]
+        return args
 
     def build_args(self, sess: dict, extra_dirs=(), read_only: bool = False) -> list:
-        args = ['--output-format', 'json', '--dangerously-skip-permissions']
-        if read_only:
-            args += ['--mode', 'plan']
+        # 注: agy --mode plan 会限制外部执行导致 lark send 被拦,只读保护通过提示词约束保障
+        args = ['--output-format', 'stream-json', '--dangerously-skip-permissions']
         for d in extra_dirs:
             args += ['--add-dir', str(d)]
         if sess['started'] and sess['id']:
@@ -514,37 +557,77 @@ class AgyBackend(CliBackend):
     def prompt_args(self, prompt: str) -> list:
         return [f'-p={prompt}']
 
+    def on_stdout_line(self, session_key: str, line: str):
+        if not line.startswith('{'):
+            return
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            return
+        if not isinstance(ev, dict):
+            return
+        kind = ev.get('event')
+        if kind == 'init':
+            cid = str(ev.get('conversation_id') or '')
+            self.log.info(f'agent [{session_key}] 会话已就绪' + (f' ({cid[:8]})' if cid else ''))
+        elif kind == 'step_update':
+            su = ev.get('step_update') or {}
+            stype = str(su.get('step_type') or '')
+            if su.get('state') == 'DONE' and stype and stype != 'user_input':
+                idx = su.get('step_index', '?')
+                dur = su.get('duration_seconds')
+                tool = su.get('tool_name') or su.get('name') or ''
+                label = f'{stype}:{tool}' if tool else stype
+                dur_s = f' ({float(dur):.1f}s)' if dur is not None else ''
+                self.log.info(f'agent [{session_key}] 步骤 #{idx} {label}{dur_s}')
+        elif kind == 'result':
+            res = ev.get('result') or {}
+            status = res.get('status') or 'DONE'
+            turns = res.get('num_turns') or 0
+            dur = res.get('duration_seconds')
+            dur_s = f', {float(dur):.1f}s' if dur is not None else ''
+            self.log.info(f'agent [{session_key}] 执行完成 ({status}, {turns} 轮{dur_s})')
+
     def parse(self, stdout: str, sess: dict) -> tuple:
         ev = None
-        try:
-            parsed = json.loads(stdout)
-            if isinstance(parsed, dict):
+        init_cid = ''
+        for line in stdout.splitlines():
+            line = line.strip()
+            if not line.startswith('{'):
+                continue
+            try:
+                parsed = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(parsed, dict):
+                continue
+            if parsed.get('event') == 'init' and parsed.get('conversation_id'):
+                init_cid = str(parsed['conversation_id'])
+            elif parsed.get('event') == 'result' and isinstance(parsed.get('result'), dict):
+                ev = parsed['result']
+            elif 'conversation_id' in parsed or 'response' in parsed:
                 ev = parsed
-        except ValueError:
-            pass
         if ev is None:
-            for line in reversed(stdout.splitlines()):
-                try:
-                    parsed = json.loads(line)
-                except ValueError:
-                    continue
-                if isinstance(parsed, dict) and ('conversation_id' in parsed or 'response' in parsed):
-                    ev = parsed
-                    break
+            try:
+                parsed = json.loads(stdout)
+                if isinstance(parsed, dict):
+                    ev = parsed.get('result') if parsed.get('event') == 'result' and isinstance(parsed.get('result'), dict) else parsed
+            except ValueError:
+                pass
         if not ev:
-            return stdout, sess['id'] if sess['started'] else ''
+            return stdout, init_cid or (sess['id'] if sess['started'] else '')
         status = str(ev.get('status') or '')
         if status and status.upper() != 'SUCCESS':
             detail = ev.get('error') or ev.get('response') or status
             self.log.warning(f'agy 本轮未成功({status}): {str(detail)[:300]}')
-        cid = str(ev.get('conversation_id') or '') or (sess['id'] if sess['started'] else '')
+        cid = str(ev.get('conversation_id') or '') or init_cid or (sess['id'] if sess['started'] else '')
         return str(ev.get('response') or '').strip(), cid
 
 
 class NullBackend(AgentBackend):
     name = 'none'
 
-    async def run(self, session_key: str, prompt: str, chat_id: str='', anchor: str='', workdir: str=None, extra_dirs=None) -> str:
+    async def run(self, session_key: str, prompt: str, chat_id: str='', anchor: str='', workdir: str=None, extra_dirs=None, read_only: bool=False) -> str:
         return ''
 
 

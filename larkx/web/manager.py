@@ -41,7 +41,7 @@ class NotFound(Exception):
 
 class LogBuffer:
     """按账号分桶的环形日志。loguru sink 在任意线程调用,deque.append 是线程安全的。"""
-    MAX = 400
+    MAX = 2000
 
     def __init__(self):
         self.buckets = {}
@@ -55,6 +55,7 @@ class LogBuffer:
             'seq': self.seq,
             'time': rec['time'].strftime('%H:%M:%S'),
             'level': rec['level'].name,
+            'kind': rec['extra'].get('kind') or '',
             'text': rec['message'],
         })
 
@@ -257,6 +258,7 @@ class Manager:
             'autostart': bool(meta.get('autostart')),
             'agent_backend': cfg['agent_backend'],
             'agent_model': cfg['agent_model'],
+            'agent_effort': cfg.get('agent_effort') or '',
             'workdir': cfg['workdir'],
             'extra_workdirs': [str(d) for d in (cfg.get('extra_workdirs') or []) if str(d).strip()],
             'agent_timeout': cfg['agent_timeout'],
@@ -265,6 +267,7 @@ class Manager:
             'mark_read': bool(cfg['mark_read']),
             'reply_in_topic': bool(cfg['reply_in_topic']),
             'reply_mode': cfg['reply_mode'],
+            'reply_thread_on_quote': bool(cfg.get('reply_thread_on_quote', True)),
             'reply_signature': cfg['reply_signature'],
             'ack_reaction': bool(cfg['ack_reaction']),
             'deny_reply': cfg['deny_reply'],

@@ -27,6 +27,8 @@ class CookieLogin(BaseModel):
 
 class TriggersIn(BaseModel):
     prefix: str = Field('', max_length=64)
+    draft_prefix: str = Field('/me', max_length=64)
+    draft_auto_recall: bool = True
     chat_types: List[Literal['p2p', 'group', 'topic_group']] = IdList
     include_chats: List[str] = IdList
     exclude_chats: List[str] = IdList
@@ -38,6 +40,7 @@ class TriggersIn(BaseModel):
     self_chat_enabled: bool = False      # 「和自己的会话」里亲手发的是否处理
     trigger_by: Literal['others', 'owner', 'all'] = 'others'   # 触发对象: 仅他人 | 仅自己(需前缀) | 自己和他人
     topic_followup: bool = True          # 本人带前缀唤起话题后,话题内他人的后续提问自动跟进
+    followup_read_only: bool = True      # 话题内他人追问触发时只读保护本地代码
 
 
 class ChatConfigIn(BaseModel):
@@ -54,6 +57,7 @@ class SettingsIn(BaseModel):
     agent_backend: Literal['claude', 'codex', 'trae', 'doubao', 'pi', 'opencode', 'cursor', 'agy', 'none']
     # 模型名会作为命令行参数传给 agent CLI,不允许以 - 开头,免得被当成别的开关
     agent_model: str = Field('', max_length=100, pattern=r'^([A-Za-z0-9][A-Za-z0-9_.:/-]*)?$')
+    agent_effort: Literal['', 'low', 'medium', 'high', 'xhigh', 'max'] = ''
     workdir: str = Field('', max_length=500)
     extra_workdirs: List[str] = Field(default_factory=list, max_length=50)
     agent_timeout: int = Field(7200, ge=0, le=86400)        # 秒;0 = 不限
@@ -62,6 +66,7 @@ class SettingsIn(BaseModel):
     mark_read: bool = True
     reply_in_topic: bool = True                           # 话题里的消息: 回到话题 / 发到外面的主会话
     reply_mode: Literal['direct', 'quote', 'thread'] = 'direct'   # 主会话的消息: 直接发 / 引用 / 开话题
+    reply_thread_on_quote: bool = True                    # 开话题回复时,引用了别人消息则挂在被引用消息下开话题
     reply_signature: str = Field('', max_length=100)      # 加在 agent 发的消息末尾
     ack_reaction: bool = False       # 交给 agent 的消息先点个 👌
     deny_reply: str = Field('', max_length=500)           # 不在「只处理这些发送者」里的人触发时回的话

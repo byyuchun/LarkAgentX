@@ -11,9 +11,9 @@ from pathlib import Path
 
 from loguru import logger
 
-from . import accounts, memory, tasks
+from . import accounts, media, memory, tasks
 from .agent import AgentDispatcher, get_backend
-from .agent.dispatcher import is_stale
+from .agent.dispatcher import is_stale, match_prefix
 from .auth import AuthExpired, LarkAuth
 from .client import LarkClient
 from .locks import FileLock
@@ -208,11 +208,34 @@ class Listener:
                 if msg_id:
                     st.save_sent(msg_id, chat_id, text, auth.user_id, root_id=root_id)
                 return msg_id
+
+            media_dir = accounts.home_of(self.account_id) / 'media'
+
+            async def download_image(chat_id: str, msg_id: str, key: str) -> str:
+                try:
+                    return await asyncio.to_thread(media.cache_image, auth, chat_id, msg_id, key, media_dir)
+                except Exception as e:
+                    log.debug(f'自动下载消息图片失败({msg_id}/{key}): {e}')
+                    return ''
+
+            async def recall_msg(msg_id: str):
+                try:
+                    await asyncio.to_thread(client.recall, msg_id)
+                    st.mark_recalled(msg_id)
+                except Exception as e:
+                    log.debug(f'自动撤回私密草稿指令失败(忽略): {e}')
+
             self.dispatcher = AgentDispatcher(backend, reply_fn, cfg=cfg, account_id=self.account_id, storage=st)
             self.dispatcher.denied = lambda msg: self._deny(msg, reply_fn)
             self.dispatcher.accepted = self._ack
             self.dispatcher.handled = self._handled
             self.dispatcher.prepare_context = prepare_context
+            self.dispatcher.download_image = download_image
+            self.dispatcher.recall_msg = recall_msg
+            try:
+                self.dispatcher.self_chat_id = str(await asyncio.to_thread(client.create_chat, auth.user_id) or '')
+            except Exception as e:
+                log.debug(f'获取「和自己的会话」id 失败(私密草稿模式暂不可用): {e}')
 
         async def on_message(msg, catchup=False):
             """返回这条是不是第一次入库。catchup: 补收回来的,发送时间太久的只入库不交给 agent。"""
@@ -239,19 +262,23 @@ class Listener:
             stale = catchup and is_stale(msg)
             typed_in_self_chat = False
             typed_self_trigger = False
+            typed_self_draft = False
             if is_own and self.dispatcher and not stale:
                 t = cfg.get('triggers') or {}
                 prefix = t.get('prefix') or ''
-                content_stripped = (msg.get('content') or '').strip()
+                draft_prefix = (t.get('draft_prefix') or '').strip()
+                raw_content = msg.get('content') or ''
                 want_self_chat = bool(chat_type == 1 and t.get('self_chat_enabled') and await asyncio.to_thread(client.is_self_chat, chat_id))
-                want_self_trigger = bool((not want_self_chat) and (t.get('trigger_by') or 'others') in ('owner', 'all') and prefix and content_stripped.startswith(prefix))
-                if want_self_chat or want_self_trigger:
+                want_self_draft = bool((not want_self_chat) and draft_prefix and match_prefix(raw_content, draft_prefix))
+                want_self_trigger = bool((not want_self_chat) and (not want_self_draft) and (t.get('trigger_by') or 'others') in ('owner', 'all') and prefix and match_prefix(raw_content, prefix))
+                if want_self_chat or want_self_draft or want_self_trigger:
                     # agent 的回复(lark send)和网页发的消息都按服务端 id 先落库;等落完,库里没有的才是用户亲手发的。
                     # 这一步挡的是死循环: agent 在这个会话里回复,回显回来不能再交给 agent
                     if not st.message_exists(msg['msg_id'], chat_id):
                         await asyncio.sleep(self.SELF_ECHO_WAIT)
                     if not st.message_exists(msg['msg_id'], chat_id):
                         typed_in_self_chat = want_self_chat
+                        typed_self_draft = want_self_draft
                         typed_self_trigger = want_self_trigger
             saved = st.save_message(msg, sender_name=sender_name, chat_name=chat_name,
                                     direction='out' if is_own else 'in')
@@ -266,7 +293,7 @@ class Listener:
                 # 补收回来的旧消息只入库,也不交给 agent。已读不在这里标: 只有 agent 回复过的消息才标(见 _handled)
                 if self.dispatcher and not stale:
                     await self.dispatcher.submit(msg, chat_name=chat_name, sender_name=sender_name, my_user_id=auth.user_id,
-                                                 self_chat=typed_in_self_chat, self_trigger=typed_self_trigger)
+                                                 self_chat=typed_in_self_chat, self_trigger=typed_self_trigger, self_draft=typed_self_draft)
             return saved
 
         self._on_message, self._auth = on_message, auth

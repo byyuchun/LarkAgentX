@@ -1,23 +1,32 @@
 import asyncio
 import os
+import re
 import time
 from datetime import datetime
+from pathlib import Path
 from xml.sax.saxutils import escape, quoteattr
 
 from loguru import logger
 
-from .. import accounts, memory
+from .. import accounts, media, memory
 
 INSTRUCTIONS = '以上是飞书会话里新到的消息。你是这个数字人,代表本人回复。如果对方也是机器人且只是互相客套寒暄,直接结束不要再接话。'
 # 讲清楚上下文的结构,不管用户有没有自定义系统提示词都附上
 CONTEXT_GUIDE = ('<history> 是这个会话自你上次处理以来的消息,按时间先后。needs_reply="true" 的是这次要你处理的'
                  '(可能是连着发的好几条,合在一起回一次,不要逐条回;如果这条同时是 role="me",说明是本人主动在调用或指示你,'
                  '直接按他的要求处理并回复);其余 role="me" 是本人亲手发的上下文(你代表的就是他:'
-                 '别重复他已经说过的,别和他矛盾,他已经回答了就不用再回);<quoted> 是被回复/引用的原消息。')
+                 '别重复他已经说过的,别和他矛盾,他已经回答了就不用再回);<quoted> 是被回复/引用的原消息;'
+                 '<attachments> 是已自动下载到本地的图片附件,可直接读取路径查看截图内容。')
 TOPIC_FOLLOWUP_GUIDE = ('这个话题是由本人此前主动唤起你介入的,当前是话题内其他成员发来的后续消息:'
                         '如果对方是在提问题、追问细节、补充报错/现象或需要你继续排查,请直接结合话题上下文和工作区代码回复;'
                         '如果只是感谢、确认(如「好的」「收到」「谢谢」)、表情包、与技术排查无关的闲聊,'
                         '或本人(role="me")已经回答过,直接结束不要回复。')
+READ_ONLY_GUIDE = ('【只读保护】当前为他人追问触发的只读模式: 严禁修改、创建、删除、格式化任何本地代码或仓库文件,'
+                   '禁止执行 git 写操作、go mod tidy、改库或提工单等变更命令;仅限只读查阅代码/文档/日志并通过 lark send 回复。')
+DRAFT_MODE_GUIDE = ('【私密草稿模式】这是本人在「{chat_name}」(会话 {chat_id}) 中发出的私密指令: '
+                    '请结合上面的原会话上下文、附件截图和工作区代码完成排查,'
+                    '但绝对不要往原会话({chat_id})发任何消息! '
+                    '请把排查结论和可直接复制发送的建议回复,发到本人与自己的私聊会话({self_chat_id})里(开头简明标注来源会话名)。')
 OUTPUT_RULES = '不需要回复就直接结束,不要解释、不要复述消息。'
 # 发送选项,写给 agent 看。撤回、转发、@ 只在明确要求时用
 SEND_HELP = ('lark send 的其他用法: -m 按 markdown 发(代码块、列表、加粗、链接);--mention 用户id:名字 真正 @ 某人(可重复,'
@@ -32,7 +41,27 @@ CONTEXT_LIMIT = 40          # 一轮最多带多少条历史消息
 FIRST_CONTEXT_LIMIT = 15    # 这个会话还没处理过(或刚重启)时往前带多少条
 FIRST_CONTEXT_SECONDS = 86400   # ……而且只带最近 24 小时的,几天前的旧话题不带
 CONTEXT_CHARS = 1500        # 每条历史消息最多带多少字
+MAX_TURN_IMAGES = 6         # 单轮最多自动下载多少张图片附件给 agent 看图
 TYPE_NAMES = {1: '私聊', 2: '群聊', 3: '话题群'}
+_LEAD_IMAGE_RE = re.compile(r'^(?:\[图片[^\]]*\]\s*)+')
+
+
+def strip_rich_prefix(content: str) -> str:
+    """去掉富文本解码时加的「[富文本]」头,让带截图/多行列表的消息也能正常匹配前缀。"""
+    c = str(content or '').strip()
+    if c.startswith('[富文本]'):
+        c = c[len('[富文本]'):].lstrip()
+    return c
+
+
+def match_prefix(content: str, prefix: str) -> bool:
+    """判断消息是否以 prefix 开头(兼容富文本前缀和开头贴图后写前缀的情况)。"""
+    if not prefix:
+        return True
+    c = strip_rich_prefix(content)
+    if c.startswith(prefix):
+        return True
+    return _LEAD_IMAGE_RE.sub('', c).lstrip().startswith(prefix)
 
 
 def _attr(v) -> str:
@@ -169,7 +198,7 @@ class AgentDispatcher:
     def __init__(self, backend, reply_fn, cfg: dict=None, account_id: str=None, storage=None):
         self.account_id = accounts.normalize(account_id)
         self.cfg = cfg if cfg is not None else accounts.get_settings(self.account_id)
-        self.log = logger.bind(account=self.account_id)
+        self.log = logger.bind(account=self.account_id, kind='agent')
         self.backend = backend
         self.reply_fn = reply_fn
         self.storage = storage
@@ -182,16 +211,37 @@ class AgentDispatcher:
         self.accepted = None       # 消息交给 agent 时的回调(点 👌)
         self.handled = None        # agent 处理完一条聊天消息后的回调(回复过就标已读)
         self.prepare_context = None  # 交给 agent 前补拉缺失根消息/历史记录的回调(由 Listener 设置)
+        self.download_image = None   # 自动下载消息图片到本地的回调 (chat_id, msg_id, key) -> path
+        self.recall_msg = None       # 自动撤回私密草稿指令的回调 (msg_id) -> None
+        self.self_chat_id = ''       # 「和自己的会话」chat_id(私密草稿模式发到这里)
+
+    def _quote_thread_root(self, msg: dict) -> str:
+        """群主会话开话题回复且引用了别人消息时,优先挂在被引用消息下开话题(系统消息除外)。"""
+        if not self.cfg.get('reply_thread_on_quote', True):
+            return ''
+        pid = str(msg.get('parent_id') or '')
+        if not pid or pid == str(msg.get('msg_id') or ''):
+            return ''
+        if self.storage:
+            try:
+                q = self.storage.get_message(pid, str(msg.get('chat_id') or ''))
+                if q and q.msg_type == 6:
+                    return ''
+            except Exception:
+                pass
+        return pid
 
     def _effective_anchor(self, msg: dict) -> str:
         """这条消息对应的最终话题 anchor: 已在话题里用原 anchor;
-        群聊主会话且设置了「开话题回复」时,会以这条消息的 msg_id 为根开出新话题,因此提前对齐到 msg_id。"""
+        群聊主会话且设置了「开话题回复」时,引用了别人消息则挂在对方消息下开话题,否则挂在自己消息下。"""
         anchor = msg.get('anchor') or ''
         if not anchor and self.cfg.get('reply_mode') == 'thread' and msg.get('chat_type') != 1 and msg.get('msg_id'):
-            return str(msg['msg_id'])
+            return self._quote_thread_root(msg) or str(msg['msg_id'])
         return anchor
 
     def session_key_of(self, msg: dict) -> str:
+        if msg.get('_draft'):
+            return f"draft:{msg.get('chat_id')}:{msg.get('anchor') or ''}"
         scope = self.cfg['context_scope']
         if scope == 'global':
             return 'global'
@@ -238,10 +288,10 @@ class AgentDispatcher:
             return 'ok'
         if (not is_owner) and trigger_by == 'owner':
             return 'skip'
-        owner_prefix_ok = bool(is_owner and self_trigger and trigger_by in ('owner', 'all') and prefix and content.startswith(prefix))
+        owner_prefix_ok = bool(is_owner and self_trigger and trigger_by in ('owner', 'all') and prefix and match_prefix(content, prefix))
         if is_owner and not self_chat and not owner_prefix_ok:
             return 'skip'
-        if prefix and (not content.startswith(prefix)):
+        if prefix and (not match_prefix(content, prefix)):
             return 'skip'
         if type_name == 'p2p' and not self_chat and t.get('dm_enabled', True) is False:
             return 'skip'
@@ -262,8 +312,27 @@ class AgentDispatcher:
             return 'denied'
         return 'ok'
 
-    async def submit(self, msg: dict, chat_name: str='', sender_name: str='', my_user_id: str='', self_chat: bool=False, self_trigger: bool=False):
+    async def submit(self, msg: dict, chat_name: str='', sender_name: str='', my_user_id: str='',
+                     self_chat: bool=False, self_trigger: bool=False, self_draft: bool=False):
         is_owner = str(msg.get('from_id')) == str(my_user_id)
+        t = self.cfg.get('triggers') or {}
+        if is_owner and self_draft:
+            draft_prefix = (t.get('draft_prefix') or '').strip()
+            chat_id = str(msg.get('chat_id'))
+            exclude = [str(x) for x in t.get('exclude_chats') or []]
+            blocked = [str(x) for x in t.get('exclude_senders') or []]
+            if not draft_prefix or not match_prefix(msg.get('content') or '', draft_prefix):
+                return
+            if (exclude and chat_id in exclude) or (blocked and str(msg.get('from_id')) in blocked):
+                return
+            if not self.self_chat_id:
+                self.log.warning('未拿到「和自己的会话」id,跳过私密草稿模式以免误发到原会话')
+                return
+            draft_msg = {**msg, '_is_own': True, '_draft': True}
+            if t.get('draft_auto_recall', True) and self.recall_msg and msg.get('msg_id'):
+                asyncio.ensure_future(self.recall_msg(str(msg['msg_id'])))
+            await self._enqueue(draft_msg, chat_name, sender_name)
+            return
         cmd, remainder = self._parse_command(msg.get('content') or '')
         if cmd and is_owner and (remainder == '' or self_chat or (self_trigger and self.check(msg, my_user_id, self_chat, self_trigger=True) == 'ok')):
             # 你本人在任何会话里发的 /stop、/clear、/end 都管用;带后续内容的写法在「和自己的会话」或自己前缀触发时认
@@ -285,7 +354,7 @@ class AgentDispatcher:
         if is_owner:
             msg['_is_own'] = True
             # 本人用前缀唤起话题(开新话题或在已有话题里调用) -> 激活该话题,后续允许跟进他人提问
-            if self_trigger and eff_anchor and (self.cfg.get('triggers') or {}).get('topic_followup', True) and self.storage:
+            if self_trigger and eff_anchor and t.get('topic_followup', True) and self.storage:
                 self.storage.topic_activate(chat_id, eff_anchor)
         elif anchor and self._topic_followup_ok(chat_id, anchor):
             msg['_topic_followup'] = True
@@ -388,7 +457,8 @@ class AgentDispatcher:
             return ''
         # 私聊没有话题,开话题回复退回引用
         if mode == 'thread' and msg.get('chat_type') != 1:
-            return f' --root {msg_id}'
+            root = self._quote_thread_root(msg) or msg_id
+            return f' --root {root}'
         return f' --quote {msg_id}'
 
     def stats(self) -> dict:
@@ -407,7 +477,7 @@ class AgentDispatcher:
     def _parse_command(self, content: str):
         t = self.cfg.get('triggers') or {}
         prefix = t.get('prefix') or ''
-        c = content.strip()
+        c = strip_rich_prefix(content)
         if prefix and c.startswith(prefix):
             c = c[len(prefix):].lstrip()
         for cmd in ('/clear', '/stop', '/end'):
@@ -466,12 +536,11 @@ class AgentDispatcher:
             self.memory_seen[session_key] = block
         return block + '\n\n'
 
-    def _conversation_xml(self, session_key: str, msgs: list, preview: bool = False) -> str:
-        """这一轮要处理的消息,连同这个会话(话题)自上一轮以来的其他消息、被引用的原消息,一起组成上下文。"""
+    def _context_rows(self, session_key: str, msgs: list):
+        """读取这一轮上下文对应的历史记录和被引用消息。返回 (rows, quoted_rows, since, until)。"""
         last = msgs[-1]
         chat_id = str(last['chat_id'])
         anchor = last.get('anchor') or ''
-        triggers = {str(m.get('msg_id')): m for m in msgs if m.get('msg_id')}
         until = max(int(m.get('create_time') or 0) for m in msgs) or None
         since = self.context_mark.get(session_key)
         # 话题内部本身有边界,首次带完整话题历史(不受 24 小时截断);主会话流只带最近 24 小时
@@ -501,6 +570,66 @@ class AgentDispatcher:
                 if root_row:
                     rows = [root_row, *rows]
                     break
+        seen_ids = {str(r.msg_id) for r in rows} | {str(m.get('msg_id')) for m in msgs if m.get('msg_id')}
+        quoted_rows = []
+        for m in msgs:
+            pid = str(m.get('parent_id') or '')
+            if pid and pid not in seen_ids and self.storage:
+                try:
+                    q = self.storage.get_message(pid, chat_id)
+                except Exception:
+                    q = None
+                if q:
+                    seen_ids.add(pid)
+                    quoted_rows.append(q)
+        return rows, quoted_rows, since, until
+
+    async def _collect_attachments(self, session_key: str, msgs: list) -> list:
+        """自动下载本轮上下文中最近的图片(含截图与富文本内嵌图),返回 [(msg_id, key, local_path), ...]。"""
+        if not self.download_image or not msgs:
+            return []
+        last = msgs[-1]
+        chat_id = str(last.get('chat_id') or '')
+        if not chat_id:
+            return []
+        rows, quoted_rows, _, _ = self._context_rows(session_key, msgs)
+        # 优先下载触发消息、被引用消息、最新历史里的图片(最多 MAX_TURN_IMAGES 张)
+        candidates = []
+        seen_pairs = set()
+
+        def add_keys(mid, content):
+            mid = str(mid or '')
+            if not mid:
+                return
+            for key in media.extract_image_keys(content):
+                pair = (mid, key)
+                if pair not in seen_pairs:
+                    seen_pairs.add(pair)
+                    candidates.append(pair)
+
+        for m in reversed(msgs):
+            add_keys(m.get('msg_id'), m.get('content'))
+        for q in reversed(quoted_rows):
+            add_keys(q.msg_id, q.content)
+        for r in reversed(rows):
+            add_keys(r.msg_id, r.content)
+        candidates = candidates[:MAX_TURN_IMAGES]
+        if not candidates:
+            return []
+        paths = await asyncio.gather(*(self.download_image(chat_id, mid, key) for mid, key in candidates), return_exceptions=True)
+        out = []
+        for (mid, key), res in zip(candidates, paths):
+            if isinstance(res, str) and res:
+                out.append((mid, key, res))
+        return out
+
+    def _conversation_xml(self, session_key: str, msgs: list, preview: bool = False, attachments=()) -> str:
+        """这一轮要处理的消息,连同这个会话(话题)自上一轮以来的其他消息、被引用的原消息、已下载图片,一起组成上下文。"""
+        last = msgs[-1]
+        chat_id = str(last['chat_id'])
+        anchor = last.get('anchor') or ''
+        triggers = {str(m.get('msg_id')): m for m in msgs if m.get('msg_id')}
+        rows, quoted_rows, since, until = self._context_rows(session_key, msgs)
         agent_ids = set()
         session_started = bool(self.backend and self.backend.session_started(session_key))
         if rows and self.storage and session_started:
@@ -515,9 +644,11 @@ class AgentDispatcher:
                 continue                 # agent 自己发的,它的会话里本来就有
             seen.add(mid)
             m = triggers.get(mid)
+            # 私密草稿指令如果已自动撤回,DB 里 content 会变成「[已撤回]」,优先保留内存中的触发原文
+            text = (m.get('content') if m and m.get('content') else r.content)
             items.append(self._message_xml(
                 mid, r.create_time, r.sender_name or (m or {}).get('_sender_name', ''), r.sender_id,
-                'me' if r.direction == 'out' else 'other', r.content, needs_reply=mid in triggers,
+                'me' if r.direction == 'out' else 'other', text, needs_reply=mid in triggers,
                 at_me=bool(m and m.get('at_me')), reply_to=r.parent_id or ''))
         for mid, m in triggers.items():  # 库里还没有的(理论上不会)也要带上
             if mid not in seen:
@@ -525,24 +656,19 @@ class AgentDispatcher:
                                                'me' if m.get('_is_own') else 'other', m.get('content'), needs_reply=True,
                                                at_me=bool(m.get('at_me')), reply_to=m.get('parent_id') or ''))
                 seen.add(mid)
-        quoted = []
-        for m in msgs:
-            pid = str(m.get('parent_id') or '')
-            if pid and pid not in seen and self.storage:
-                try:
-                    q = self.storage.get_message(pid, chat_id)
-                except Exception:
-                    q = None
-                if q:
-                    seen.add(pid)
-                    quoted.append(f'<quoted id={_attr(pid)} from={_attr(q.sender_name)} time={_attr(_ts({"create_time": q.create_time}))}>'
-                                  f'{escape(_clip(q.content))}</quoted>')
+        quoted = [f'<quoted id={_attr(q.msg_id)} from={_attr(q.sender_name)} time={_attr(_ts({"create_time": q.create_time}))}>'
+                  f'{escape(_clip(q.content))}</quoted>' for q in quoted_rows]
+        att_block = []
+        if attachments:
+            att_block = ['<attachments>',
+                         *(f'  <image msg_id={_attr(mid)} key={_attr(key)} path={_attr(path)}/>' for mid, key, path in attachments),
+                         '</attachments>']
         if not preview:
             self.context_mark[session_key] = until or int(time.time())
         head = (f'<conversation id={_attr(chat_id)} name={_attr(last.get("_chat_name") or "")} '
                 f'type={_attr(TYPE_NAMES.get(last.get("chat_type"), last.get("chat_type_name") or ""))} topic={_attr(anchor)}>')
         note = '' if since else '\n<!-- 这是这个会话最近的消息,其中有些你之前可能已经看过 -->'
-        return '\n'.join([head + note, '<history>', *items, '</history>', *quoted, '</conversation>'])
+        return '\n'.join([head + note, '<history>', *items, '</history>', *quoted, *att_block, '</conversation>'])
 
     @staticmethod
     def _message_xml(msg_id, create_time, sender, sender_id, role, content, needs_reply=False, at_me=False, reply_to='') -> str:
@@ -555,7 +681,7 @@ class AgentDispatcher:
             attrs += f' reply_to={_attr(reply_to)}'
         return f'  <message {attrs}>{escape(_clip(content))}</message>'
 
-    def build_prompt(self, session_key: str, msgs, preview: bool = False) -> str:
+    def build_prompt(self, session_key: str, msgs, preview: bool = False, attachments=()) -> str:
         msgs = msgs if isinstance(msgs, list) else [msgs]
         msg = msgs[-1]
         acct = self._account_flag()
@@ -563,15 +689,26 @@ class AgentDispatcher:
             return (memory.prompt_block(self.account_id) + '\n\n' + memory.REVIEW_PROMPT.format(acct=acct) + '\n\n<chats>\n'
                     + msg['_review'] + '\n</chats>')
         chat_id = str(msg['chat_id'])
+        is_draft = any(m.get('_draft') for m in msgs) and bool(self.self_chat_id)
+        is_followup_only = any(m.get('_topic_followup') for m in msgs) and not any(m.get('_is_own') for m in msgs)
+        is_read_only = is_followup_only and bool((self.cfg.get('triggers') or {}).get('followup_read_only', True))
         if msg.get('_task') is not None:
             body = f'<task>\n  <chat id={quoteattr(chat_id)} anchor={quoteattr(str(msg.get("anchor") or ""))}/>\n  <content>{escape(msg["_task"])}</content>\n</task>'
             lead = '以上是你之前安排的定时任务,现在到点了,请执行。'
         else:
-            body = self._conversation_xml(session_key, msgs, preview) + '\n' + CONTEXT_GUIDE
+            body = self._conversation_xml(session_key, msgs, preview, attachments=attachments) + '\n' + CONTEXT_GUIDE
             lead = self.cfg.get('system_prompt') or INSTRUCTIONS
-            if any(m.get('_topic_followup') for m in msgs) and not any(m.get('_is_own') for m in msgs):
+            if is_draft:
+                src_name = msg.get('_chat_name') or chat_id
+                lead = lead + '\n' + DRAFT_MODE_GUIDE.format(chat_name=src_name, chat_id=chat_id, self_chat_id=self.self_chat_id)
+            elif is_followup_only:
                 lead = lead + '\n' + TOPIC_FOLLOWUP_GUIDE
-        reply_cmd = f'lark send {chat_id} "<回复内容>"' + self.reply_flags(msg) + acct
+            if is_read_only:
+                lead = lead + '\n' + READ_ONLY_GUIDE
+        if is_draft:
+            reply_cmd = f'lark send {self.self_chat_id} "<回复内容>"' + acct
+        else:
+            reply_cmd = f'lark send {chat_id} "<回复内容>"' + self.reply_flags(msg) + acct
         rules = f'要回复就执行: {reply_cmd}\n' + OUTPUT_RULES + '\n' + SEND_HELP
         return self._memory_prefix(session_key, chat_id, preview) + body + '\n\n' + lead + '\n' + rules
 
@@ -588,16 +725,28 @@ class AgentDispatcher:
                 await self.prepare_context(msgs)
             except Exception as e:
                 self.log.debug(f'补拉上下文失败(忽略): {e}')
-        prompt = self.build_prompt(session_key, msgs)
+        attachments = await self._collect_attachments(session_key, msgs) if batchable(msg) else []
+        prompt = self.build_prompt(session_key, msgs, attachments=attachments)
+        is_draft = any(m.get('_draft') for m in msgs)
+        is_followup_only = any(m.get('_topic_followup') for m in msgs) and not any(m.get('_is_own') for m in msgs)
+        is_read_only = is_followup_only and bool((self.cfg.get('triggers') or {}).get('followup_read_only', True))
         try:
             kwargs = {}
             wd, extra = workspaces_for(self.cfg, msg.get('chat_id') or '')
+            extra = list(extra)
+            if attachments:
+                att_dir = str(Path(attachments[0][2]).parent)
+                if att_dir != wd and att_dir not in extra:
+                    extra.append(att_dir)
             if wd:
                 kwargs['workdir'] = wd
             if extra:
                 kwargs['extra_dirs'] = extra
-            out = await self.backend.run(session_key, prompt, chat_id=str(msg.get('chat_id') or ''),
-                                         anchor=self._effective_anchor(msg), **kwargs)
+            if is_read_only:
+                kwargs['read_only'] = True
+            target_chat = self.self_chat_id if (is_draft and self.self_chat_id) else str(msg.get('chat_id') or '')
+            target_anchor = '' if is_draft else self._effective_anchor(msg)
+            out = await self.backend.run(session_key, prompt, chat_id=target_chat, anchor=target_anchor, **kwargs)
         finally:
             # 第一轮没跑成功时会话还没建立(下次会换一个新会话),记忆下次要重新附上
             if not self.backend.session_started(session_key):
@@ -605,6 +754,6 @@ class AgentDispatcher:
                 self.context_mark.pop(session_key, None)
         if out:
             self.log.debug(f'[{session_key}] agent 输出: {out[:200]}')
-        if self.handled and batchable(msg):
+        if self.handled and batchable(msg) and not is_draft:
             for m in msgs:
                 await self.handled(m)
