@@ -275,6 +275,7 @@ class Manager:
             'memory_review_at': cfg['memory_review_at'],
             'triggers': cfg['triggers'],
             'chat_configs': [r for r in (cfg.get('chat_configs') or []) if isinstance(r, dict)],
+            'watch_rules': [r for r in (cfg.get('watch_rules') or []) if isinstance(r, dict)],
         }
 
     def save_settings(self, account_id: str, data: dict) -> dict:

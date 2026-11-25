@@ -27,6 +27,9 @@ DRAFT_MODE_GUIDE = ('【私密草稿模式】这是本人在「{chat_name}」(�
                     '请结合上面的原会话上下文、附件截图和工作区代码完成排查,'
                     '但绝对不要往原会话({chat_id})发任何消息! '
                     '请把排查结论和可直接复制发送的建议回复,发到本人与自己的私聊会话({self_chat_id})里(开头简明标注来源会话名)。')
+WATCH_MODE_GUIDE = ('【静默群监控模式】你正在后台静默监控「{chat_name}」(会话 {chat_id})的新消息。'
+                    '绝对不要往原群({chat_id})发任何消息! 只把需要汇报或提醒本人的内容发到本人与自己的私聊会话({self_chat_id})。'
+                    '如果这条消息只是无关闲聊或无需打扰本人,直接结束不要发送任何消息。')
 OUTPUT_RULES = '不需要回复就直接结束,不要解释、不要复述消息。'
 # 发送选项,写给 agent 看。撤回、转发、@ 只在明确要求时用
 SEND_HELP = ('lark send 的其他用法: -m 按 markdown 发(代码块、列表、加粗、链接);--mention 用户id:名字 真正 @ 某人(可重复,'
@@ -240,6 +243,8 @@ class AgentDispatcher:
         return anchor
 
     def session_key_of(self, msg: dict) -> str:
+        if msg.get('_watch'):
+            return f"watch:{msg.get('chat_id')}"
         if msg.get('_draft'):
             return f"draft:{msg.get('chat_id')}:{msg.get('anchor') or ''}"
         scope = self.cfg['context_scope']
@@ -248,6 +253,29 @@ class AgentDispatcher:
         if scope == 'chat':
             return str(msg.get('chat_id'))
         return f"{msg.get('chat_id')}:{self._effective_anchor(msg)}"
+
+    def match_watch_rule(self, msg: dict, sender_name: str = '') -> dict:
+        """检查消息是否命中后台静默监控规则(仅监控非本人、非系统消息),命中返回规则 dict,否则返回 {}。"""
+        if msg.get('msg_type') == 6:
+            return {}
+        chat_id = str(msg.get('chat_id') or '')
+        content = (msg.get('content') or '').lower()
+        sender_id = str(msg.get('from_id') or '')
+        sname = (sender_name or '').strip().lower()
+        for rule in self.cfg.get('watch_rules') or []:
+            if not isinstance(rule, dict) or rule.get('enabled') is False:
+                continue
+            if str(rule.get('chat_id') or '') != chat_id:
+                continue
+            kws = [str(k).strip().lower() for k in (rule.get('keywords') or []) if str(k).strip()]
+            senders = [str(s).strip().lower() for s in (rule.get('senders') or []) if str(s).strip()]
+            if not kws and not senders:
+                return rule
+            if senders and (sender_id.lower() in senders or (sname and any(s in sname for s in senders))):
+                return rule
+            if kws and any(k in content for k in kws):
+                return rule
+        return {}
 
     def _topic_followup_ok(self, chat_id: str, anchor: str) -> bool:
         t = self.cfg.get('triggers') or {}
@@ -344,6 +372,12 @@ class AgentDispatcher:
                 await self.denied(msg)
             return
         if verdict != 'ok':
+            if not is_owner and self.self_chat_id:
+                rule = self.match_watch_rule(msg, sender_name)
+                if rule:
+                    watch_msg = {**msg, '_watch': True, '_watch_name': rule.get('name') or chat_name,
+                                 '_watch_prompt': (rule.get('prompt') or '').strip()}
+                    await self._enqueue(watch_msg, chat_name, sender_name)
             return
         if cmd and not is_owner:
             return             # 别人发的 /stop、/clear、/end 不当命令,也不交给 agent
@@ -689,23 +723,31 @@ class AgentDispatcher:
             return (memory.prompt_block(self.account_id) + '\n\n' + memory.REVIEW_PROMPT.format(acct=acct) + '\n\n<chats>\n'
                     + msg['_review'] + '\n</chats>')
         chat_id = str(msg['chat_id'])
-        is_draft = any(m.get('_draft') for m in msgs) and bool(self.self_chat_id)
-        is_followup_only = any(m.get('_topic_followup') for m in msgs) and not any(m.get('_is_own') for m in msgs)
-        is_read_only = is_followup_only and bool((self.cfg.get('triggers') or {}).get('followup_read_only', True))
+        is_watch = any(m.get('_watch') for m in msgs) and bool(self.self_chat_id)
+        is_draft = (not is_watch) and any(m.get('_draft') for m in msgs) and bool(self.self_chat_id)
+        is_private_reply = is_watch or is_draft
+        is_followup_only = (not is_private_reply) and any(m.get('_topic_followup') for m in msgs) and not any(m.get('_is_own') for m in msgs)
+        is_read_only = is_watch or (is_followup_only and bool((self.cfg.get('triggers') or {}).get('followup_read_only', True)))
         if msg.get('_task') is not None:
             body = f'<task>\n  <chat id={quoteattr(chat_id)} anchor={quoteattr(str(msg.get("anchor") or ""))}/>\n  <content>{escape(msg["_task"])}</content>\n</task>'
             lead = '以上是你之前安排的定时任务,现在到点了,请执行。'
         else:
             body = self._conversation_xml(session_key, msgs, preview, attachments=attachments) + '\n' + CONTEXT_GUIDE
             lead = self.cfg.get('system_prompt') or INSTRUCTIONS
-            if is_draft:
+            if is_watch:
+                src_name = msg.get('_watch_name') or msg.get('_chat_name') or chat_id
+                lead = WATCH_MODE_GUIDE.format(chat_name=src_name, chat_id=chat_id, self_chat_id=self.self_chat_id)
+                wprompt = next((m.get('_watch_prompt') for m in reversed(msgs) if m.get('_watch_prompt')), '')
+                if wprompt:
+                    lead = lead + '\n监控要求: ' + wprompt
+            elif is_draft:
                 src_name = msg.get('_chat_name') or chat_id
                 lead = lead + '\n' + DRAFT_MODE_GUIDE.format(chat_name=src_name, chat_id=chat_id, self_chat_id=self.self_chat_id)
             elif is_followup_only:
                 lead = lead + '\n' + TOPIC_FOLLOWUP_GUIDE
             if is_read_only:
                 lead = lead + '\n' + READ_ONLY_GUIDE
-        if is_draft:
+        if is_private_reply:
             reply_cmd = f'lark send {self.self_chat_id} "<回复内容>"' + acct
         else:
             reply_cmd = f'lark send {chat_id} "<回复内容>"' + self.reply_flags(msg) + acct
@@ -727,9 +769,11 @@ class AgentDispatcher:
                 self.log.debug(f'补拉上下文失败(忽略): {e}')
         attachments = await self._collect_attachments(session_key, msgs) if batchable(msg) else []
         prompt = self.build_prompt(session_key, msgs, attachments=attachments)
-        is_draft = any(m.get('_draft') for m in msgs)
-        is_followup_only = any(m.get('_topic_followup') for m in msgs) and not any(m.get('_is_own') for m in msgs)
-        is_read_only = is_followup_only and bool((self.cfg.get('triggers') or {}).get('followup_read_only', True))
+        is_watch = any(m.get('_watch') for m in msgs)
+        is_draft = (not is_watch) and any(m.get('_draft') for m in msgs)
+        is_private_reply = is_watch or is_draft
+        is_followup_only = (not is_private_reply) and any(m.get('_topic_followup') for m in msgs) and not any(m.get('_is_own') for m in msgs)
+        is_read_only = is_watch or (is_followup_only and bool((self.cfg.get('triggers') or {}).get('followup_read_only', True)))
         try:
             kwargs = {}
             wd, extra = workspaces_for(self.cfg, msg.get('chat_id') or '')
@@ -744,8 +788,8 @@ class AgentDispatcher:
                 kwargs['extra_dirs'] = extra
             if is_read_only:
                 kwargs['read_only'] = True
-            target_chat = self.self_chat_id if (is_draft and self.self_chat_id) else str(msg.get('chat_id') or '')
-            target_anchor = '' if is_draft else self._effective_anchor(msg)
+            target_chat = self.self_chat_id if (is_private_reply and self.self_chat_id) else str(msg.get('chat_id') or '')
+            target_anchor = '' if is_private_reply else self._effective_anchor(msg)
             out = await self.backend.run(session_key, prompt, chat_id=target_chat, anchor=target_anchor, **kwargs)
         finally:
             # 第一轮没跑成功时会话还没建立(下次会换一个新会话),记忆下次要重新附上
@@ -754,6 +798,6 @@ class AgentDispatcher:
                 self.context_mark.pop(session_key, None)
         if out:
             self.log.debug(f'[{session_key}] agent 输出: {out[:200]}')
-        if self.handled and batchable(msg) and not is_draft:
+        if self.handled and batchable(msg) and not is_private_reply:
             for m in msgs:
                 await self.handled(m)

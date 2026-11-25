@@ -7,7 +7,7 @@
 - 图片、文件:先上传(见 media.py)拿到 key 再发。
 
 富文本的结构是按飞书网页版实际发出的数据确定的:
-- 根是 DOCS(22),下面挂块级元素:段落 P(3)、列表 UL(26) / OL(27) / LI(28)、引用 QUOTE(29)、代码块 CODE_BLOCK(31)。
+- 根是 DOCS(22),下面挂块级元素:段落 P(3)、列表 UL(26) / OL(27) / LI(28)、引用 QUOTE(29)、代码块 P(3)->CODE_BLOCK_V2(37)。
 - 加粗、斜体是带样式(fontWeight / fontStyle)的 TEXT(1),样式同时登记进 elements.styles 和 styleRefs。
 - 链接 A(6) 用 AnchorProperty。容器元素也要带 property(空字节),innerText 必须设置,否则服务端返回 400。
 - 行内代码服务端会剔除,所以只保留文字;标题服务端会降级成段落,这里发成加粗的段落。
@@ -18,17 +18,32 @@ from .gateway import _lark_all
 from .ids import generate_request_cid
 
 TYPE_POST, TYPE_FILE, TYPE_TEXT, TYPE_IMAGE = 2, 3, 4, 5
-TEXT, PARA, AT, LINK, DOCS, UL, OL, LI, QUOTE, CODE_BLOCK = 1, 3, 5, 6, 22, 26, 27, 28, 29, 31
+TEXT, PARA, AT, LINK, DOCS, UL, OL, LI, QUOTE, CODE_BLOCK_V2 = 1, 3, 5, 6, 22, 26, 27, 28, 29, 37
 BOLD = ('fontWeight', 'bold')
 ITALIC = ('fontStyle', 'italic')
 ANCHOR_CUSTOM = 3   # AnchorProperty.Scene.CUSTOM_EDIT:自定义文字的链接
 
-# CodeBlockProperty.Language(V1 枚举);不认识的语言按 SHELL
-CODE_LANGS = {'js': 0, 'javascript': 0, 'bash': 2, 'sh': 2, 'zsh': 2, 'cs': 3, 'csharp': 3, 'cpp': 4, 'c++': 4, 'c': 4,
-              'html': 6, 'xml': 7, 'http': 8, 'json': 9, 'java': 10, 'makefile': 11, 'markdown': 12, 'md': 12, 'nginx': 13,
-              'objc': 14, 'php': 15, 'perl': 16, 'py': 17, 'python': 17, 'ruby': 18, 'rb': 18, 'sql': 19, 'shell': 20,
-              'go': 21, 'golang': 21, 'scss': 22, 'lua': 23, 'kotlin': 25, 'kt': 25}
-DEFAULT_LANG = 20
+# CodeBlockV2Property.Language(V2 枚举);不认识的语言按 PLAIN_TEXT
+CODE_LANGS = {
+    'text': 0, 'txt': 0, 'plain': 0, 'plaintext': 0,
+    'bash': 6, 'sh': 6, 'zsh': 6,
+    'cs': 7, 'csharp': 7, 'c#': 7,
+    'cpp': 8, 'c++': 8, 'cc': 8, 'cxx': 8,
+    'c': 9, 'cmake': 10, 'css': 12, 'dart': 15, 'diff': 17,
+    'dockerfile': 19, 'docker': 19,
+    'go': 23, 'golang': 23, 'graphql': 24, 'groovy': 25,
+    'html': 26, 'http': 28, 'json': 30, 'java': 31,
+    'js': 32, 'javascript': 32, 'jsx': 32, 'kotlin': 34, 'kt': 34,
+    'latex': 35, 'tex': 35, 'lua': 37, 'makefile': 39, 'make': 39,
+    'markdown': 40, 'md': 40, 'nginx': 41, 'objc': 42, 'objective-c': 42,
+    'php': 44, 'perl': 45, 'powershell': 46, 'ps1': 46, 'properties': 48, 'ini': 48,
+    'protobuf': 49, 'proto': 49, 'py': 50, 'python': 50,
+    'r': 51, 'ruby': 52, 'rb': 52, 'rust': 53, 'rs': 53,
+    'scss': 55, 'sass': 55, 'sql': 56, 'mysql': 56, 'scala': 57,
+    'shell': 59, 'solidity': 60, 'swift': 61, 'toml': 62, 'thrift': 63,
+    'ts': 64, 'typescript': 64, 'tsx': 64, 'xml': 67, 'yaml': 68, 'yml': 68,
+}
+DEFAULT_LANG = 0
 
 FENCE = re.compile(r'^```\s*([\w+#.-]*)\s*$')
 HEADING = re.compile(r'^#{1,6}\s+(.*)$')
@@ -221,8 +236,13 @@ def fill_markdown(rich, markdown: str, mentions=()):
             i += 1
             code = '\n'.join(body)
             t.inner.append(code)
-            prop = t.E.CodeBlockProperty(language=CODE_LANGS.get(fence.group(1).lower(), DEFAULT_LANG), content=code + '\n')
-            blocks.append(t.node(CODE_BLOCK, prop.SerializeToString()))
+            V2 = t.E.CodeBlockV2Property
+            v2_lines = [V2.LineContent(contents=[V2.Content(content=ln, type=0)]) if ln else V2.LineContent()
+                        for ln in (body or [''])]
+            prop = V2(language=CODE_LANGS.get(fence.group(1).lower(), DEFAULT_LANG),
+                      contents=v2_lines, wordWrap=True, version=0)
+            code_id = t.node(CODE_BLOCK_V2, prop.SerializeToString())
+            blocks.append(t.node(PARA, children=[code_id]))
             t.end_block()
             continue
         if not line or RULE.match(line):

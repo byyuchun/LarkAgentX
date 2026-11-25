@@ -34,6 +34,7 @@ DEFAULTS = {
     "memory_enabled": False,
     "memory_review_at": "00:00",
     "chat_configs": [],        # [{chat_id, workdir}]「只处理这些会话」里每个会话(私聊或群聊)单独的设置
+    "watch_rules": [],         # [{chat_id, name, keywords, senders, prompt, enabled}] 静默监控群消息,命中后仅私发到「和自己的会话」
     "triggers": {
         "prefix": "",
         "draft_prefix": "/me",     # 私密草稿前缀: 本人在任意会话发送时,查完上下文发到「和自己的会话」,不发到原群
@@ -56,7 +57,7 @@ DEFAULTS = {
 # 可以按账号覆盖(web 里设置)的配置项
 SETTING_KEYS = ("agent_backend", "agent_model", "agent_effort", "workdir", "extra_workdirs", "agent_timeout", "system_prompt", "context_scope", "mark_read", "reply_in_topic",
                 "reply_mode", "reply_thread_on_quote", "reply_signature", "ack_reaction", "deny_reply", "memory_enabled", "memory_review_at", "triggers",
-                "chat_configs")
+                "chat_configs", "watch_rules")
 
 TRIGGER_ENV = {
     "prefix": "LARKX_TRIGGER_PREFIX",

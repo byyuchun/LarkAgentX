@@ -51,6 +51,16 @@ class ChatConfigIn(BaseModel):
     notes: str = Field('', max_length=2000)                            # 会话说明: 每次换新内容时附给 agent
 
 
+class WatchRuleIn(BaseModel):
+    """静默监控规则: 监听指定群的特定关键词/发送者,命中后由 agent 整理并仅私发到「和自己的会话」,绝不往原群发言。"""
+    chat_id: str = Field(..., min_length=1, max_length=64, pattern=r'^[A-Za-z0-9_-]+$')
+    name: str = Field('', max_length=120)
+    keywords: List[str] = Field(default_factory=list, max_length=50)
+    senders: List[str] = Field(default_factory=list, max_length=50)
+    prompt: str = Field('', max_length=4000)
+    enabled: bool = True
+
+
 class SettingsIn(BaseModel):
     remark: str = Field('', max_length=40)                # 备注名,可留空(留空显示飞书里的姓名)
     autostart: bool = False
@@ -74,6 +84,7 @@ class SettingsIn(BaseModel):
     memory_review_at: str = Field('00:00', pattern=r'^(([01]\d|2[0-3]):[0-5]\d)?$')   # 每日回顾时间,空 = 不回顾
     triggers: TriggersIn = Field(default_factory=TriggersIn)
     chat_configs: List[ChatConfigIn] = Field(default_factory=list, max_length=200)
+    watch_rules: List[WatchRuleIn] = Field(default_factory=list, max_length=50)
 
 
 class SendIn(BaseModel):

@@ -120,6 +120,17 @@ export interface Settings {
   memory_review_at: string
   triggers: Triggers
   chat_configs: ChatConfig[]
+  watch_rules?: WatchRule[]
+}
+
+/** 静默群监控规则 */
+export interface WatchRule {
+  chat_id: string
+  name: string
+  keywords: string[]
+  senders: string[]
+  prompt: string
+  enabled: boolean
 }
 
 /** 「只处理这些会话」里一个会话(私聊或群聊)单独的设置 */
